@@ -12,7 +12,6 @@ import {
   realpathSync,
   rmSync,
 } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { replaceFileAtomically } from "@hyperframes/core/atomic-file";
 import {
@@ -64,9 +63,10 @@ import {
   type LogRecord,
   type Manifest,
 } from "./historyLog.js";
+import { hyperframesCacheDir } from "@hyperframes/core/cache-dir";
 
 /** Where hosts keep project histories unless told otherwise: outside every project, so no tidy-up takes one away. */
-export const DEFAULT_HISTORY_ROOT = join(homedir(), ".cache", "hyperframes", "history");
+export const DEFAULT_HISTORY_ROOT = hyperframesCacheDir("history");
 
 export interface ProjectHistoryOptions {
   projectDir: string;
@@ -211,6 +211,22 @@ const statKey = (file: { size: number; mtimeMs: number; ctimeMs: number }, swept
   sweptAt - Math.max(file.mtimeMs, file.ctimeMs) < RACY_MS
     ? ""
     : `${file.size}:${file.mtimeMs}:${file.ctimeMs}`;
+
+const FIRST_COPY_SLOTS_IN_PROCESS = 4;
+let firstCopiesRunning = 0;
+const firstCopiesWaiting: (() => void)[] = [];
+
+async function inFirstCopySlot<T>(copy: () => Promise<T>): Promise<T> {
+  if (firstCopiesRunning < FIRST_COPY_SLOTS_IN_PROCESS) firstCopiesRunning += 1;
+  else await new Promise<void>((yours) => firstCopiesWaiting.push(yours));
+  try {
+    return await copy();
+  } finally {
+    const next = firstCopiesWaiting.shift();
+    if (next) next();
+    else firstCopiesRunning -= 1;
+  }
+}
 
 const MEDIA_LEDGER = ".media/manifest.jsonl";
 const KEPT_HIDDEN_PATHS = new Set<string>([...STUDIO_SIGNATURE_MANIFEST_PATHS, MEDIA_LEDGER]);
@@ -548,11 +564,18 @@ class Engine {
   async firstOpen(): Promise<void> {
     const sweptAt = this.now();
     const files = historyFiles(this.dir);
-    for (const file of files.filter((file) => file.size <= COPY_LATER_ABOVE_BYTES)) {
-      const hash = await this.storeIfPresent(file.path);
-      if (this.whereFolder() !== "here") throw this.replaced();
-      if (hash !== null) this.tracked.set(file.path, { hash, stat: statKey(file, sweptAt) });
-    }
+    const copied = files.filter((file) => file.size <= COPY_LATER_ABOVE_BYTES);
+    const hashes = await Promise.allSettled(
+      copied.map((file) => inFirstCopySlot(() => this.storeIfPresent(file.path))),
+    );
+    // Nothing names these copies until the log below is written, so one look at the end covers the whole copy.
+    if (this.whereFolder() !== "here") throw this.replaced();
+    copied.forEach((file, i) => {
+      const result = hashes[i]!;
+      if (result.status === "rejected") throw result.reason;
+      if (result.value !== null)
+        this.tracked.set(file.path, { hash: result.value, stat: statKey(file, sweptAt) });
+    });
     this.log.baseline = this.manifest();
     this.log.keepsLedger = true;
     this.persistLog();
@@ -1107,7 +1130,12 @@ class Engine {
     const changes = [...target]
       .filter(([path, hash]) => (this.tracked.get(path)?.hash ?? null) !== hash)
       .sort(([, a], [, b]) => Number(a !== null) - Number(b !== null));
-    const gone = changes.find(([, hash]) => hash !== null && !this.blobs.has(hash));
+    const setAsideByDeletesFirst = new Set(
+      changes.filter(([, hash]) => hash === null).map(([path]) => this.tracked.get(path)?.hash),
+    );
+    const gone = changes.find(
+      ([, hash]) => hash !== null && !this.blobs.has(hash) && !setAsideByDeletesFirst.has(hash),
+    );
     if (gone)
       throw new Error(
         `An earlier version of ${gone[0]} is not kept, so this cannot be brought back.`,
@@ -1122,6 +1150,9 @@ class Engine {
     this.windows.push(group);
     try {
       for (const [path, hash] of changes) await this.writeProjectFile(path, hash);
+      await this.blobs.release(
+        changes.flatMap(([path, hash]) => (hash ? [[hash, path] as const] : [])),
+      );
       await this.sweep();
     } finally {
       this.windows = this.windows.filter((open) => open !== group);
@@ -1138,6 +1169,9 @@ class Engine {
       const version = hash === null ? DELETED_VERSION : hashVersion(hash);
       recordFileWriteReceipt(absPath, { path, version, writeToken });
     }
+    const standing = lstatSync(absPath, { throwIfNoEntry: false });
+    if (standing?.isFile() && isUncopied(path, standing.size))
+      await this.blobs.keep(path, absPath, hash === null);
     if (hash === null) {
       this.assertWritable();
       rmSync(absPath, { force: true });

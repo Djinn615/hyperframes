@@ -1,5 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { isRenderFrameVideo, preloadMedia, releaseMedia } from "./preloadMedia";
+import { mediaElementTime } from "./mediaClock";
+import {
+  isRenderFrameVideo,
+  preloadMedia,
+  prepareUpcomingMedia,
+  releaseMedia,
+} from "./preloadMedia";
 
 function media(tagName = "VIDEO", networkState = 2, readyState = 0, id = "", renderId = "") {
   const getAttribute = (name: string) => (name === "data-hf-render-id" && renderId) || null;
@@ -26,6 +32,19 @@ describe("a video the render replaces with extracted frames", () => {
     expect(video.preload).toBe("none");
     expect(video.load).not.toHaveBeenCalled();
     expect(isRenderFrameVideo(video)).toBe(true);
+  });
+
+  it("does not seek a replaced video's source offset", () => {
+    ids.__HF_RENDER_FRAME_VIDEO_IDS = ["cut"];
+    const video = document.createElement("video");
+    video.id = "cut";
+    video.setAttribute("data-media-start", "6");
+    document.body.appendChild(video);
+
+    prepareUpcomingMedia(video, () => true);
+    video.dispatchEvent(new Event("loadedmetadata"));
+    expect(video.currentTime).toBe(0);
+    video.remove();
   });
 
   it("leaves other videos and audio with the same id to the eager preload", () => {
@@ -97,6 +116,50 @@ describe("releasing a clip's download", () => {
     expect(video.getAttribute("src")).toBe("a.mp4");
   });
 
+  it("keeps a clip whose whole file is buffered", () => {
+    const video = document.createElement("video");
+    video.setAttribute("src", "a.mp4");
+    Object.defineProperty(video, "duration", { value: 6.67 });
+    Object.defineProperty(video, "buffered", {
+      value: { length: 1, start: () => 0, end: () => 6.67 },
+    });
+    video.load = vi.fn();
+
+    releaseMedia(video);
+    expect(video.load).not.toHaveBeenCalled();
+    expect(video.getAttribute("src")).toBe("a.mp4");
+  });
+
+  it("frees a clip whose whole file is buffered when asked to", () => {
+    const video = document.createElement("video");
+    video.setAttribute("src", "a.mp4");
+    Object.defineProperty(video, "duration", { value: 6.67 });
+    Object.defineProperty(video, "buffered", {
+      value: { length: 1, start: () => 0, end: () => 6.67 },
+    });
+    video.load = vi.fn();
+
+    releaseMedia(video, true);
+    expect(video.load).toHaveBeenCalledTimes(1);
+    expect(video.getAttribute("src")).toBe("a.mp4");
+  });
+
+  it.each([
+    [0, 15],
+    [430, 2642],
+  ])("releases a clip with only %s-%s s of a long file buffered", (from, to) => {
+    const video = document.createElement("video");
+    video.setAttribute("src", "a.mp4");
+    Object.defineProperty(video, "duration", { value: 2642 });
+    Object.defineProperty(video, "buffered", {
+      value: { length: 1, start: () => from, end: () => to },
+    });
+    video.load = vi.fn();
+
+    releaseMedia(video);
+    expect(video.load).toHaveBeenCalledTimes(1);
+  });
+
   it("leaves a clip on <source> children, their order and its markup untouched", () => {
     const video = document.createElement("video");
     video.innerHTML =
@@ -107,5 +170,94 @@ describe("releasing a clip's download", () => {
     releaseMedia(video);
     expect(video.load).not.toHaveBeenCalled();
     expect(video.innerHTML).toBe(markup);
+  });
+});
+
+describe("preparing upcoming video playback", () => {
+  afterEach(() => vi.restoreAllMocks());
+  function video() {
+    const element = document.createElement("video");
+    element.setAttribute("data-media-start", "6");
+    element.load = vi.fn();
+    document.body.appendChild(element);
+    return element;
+  }
+
+  it("does not overwrite an in-flight seek", () => {
+    const element = video();
+    Object.defineProperty(element, "readyState", { value: 1 });
+    Object.defineProperty(element, "seeking", { value: true });
+    element.currentTime = 7;
+
+    prepareUpcomingMedia(element, () => true);
+    expect(element.currentTime).toBe(7);
+    element.remove();
+  });
+
+  it("prepares a clip again after its resource was released and reloaded", () => {
+    const element = video();
+    prepareUpcomingMedia(element, () => true);
+    element.dispatchEvent(new Event("loadedmetadata"));
+    expect(element.currentTime).toBe(mediaElementTime(6));
+    element.currentTime = 0;
+    releaseMedia(element);
+
+    prepareUpcomingMedia(element, () => true);
+    element.dispatchEvent(new Event("loadedmetadata"));
+    expect(element.currentTime).toBe(mediaElementTime(6));
+    element.remove();
+  });
+
+  it("cancels preparation when the clip leaves the preload window", () => {
+    const element = video();
+    prepareUpcomingMedia(element, () => true);
+    releaseMedia(element);
+    element.dispatchEvent(new Event("loadedmetadata"));
+    expect(element.currentTime).toBe(0);
+    element.remove();
+  });
+
+  it("reads the current offset after metadata instead of an offset from an earlier edit", () => {
+    const element = video();
+    prepareUpcomingMedia(element, () => true);
+    element.setAttribute("data-media-start", "8");
+    element.dispatchEvent(new Event("loadedmetadata"));
+    expect(element.currentTime).toBe(mediaElementTime(8));
+    element.remove();
+  });
+
+  it("does not seek a detached clip when its metadata arrives", () => {
+    const element = video();
+    prepareUpcomingMedia(element, () => true);
+    element.remove();
+    element.dispatchEvent(new Event("loadedmetadata"));
+    expect(element.currentTime).toBe(0);
+  });
+
+  it("does not prepare an audio clip's source offset outside WebKit", () => {
+    const element = document.createElement("audio");
+    element.setAttribute("data-media-start", "6");
+    element.load = vi.fn();
+    document.body.appendChild(element);
+
+    prepareUpcomingMedia(element, () => true);
+    element.dispatchEvent(new Event("loadedmetadata"));
+    expect(element.currentTime).toBe(0);
+    element.remove();
+  });
+
+  it("prepares an upcoming audio clip's source offset in WebKit, so the cut has no seek to wait for", () => {
+    vi.spyOn(navigator, "userAgent", "get").mockReturnValue(
+      "Mozilla/5.0 AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    );
+    const element = document.createElement("audio");
+    element.setAttribute("data-media-start", "6");
+    element.load = vi.fn();
+    document.body.appendChild(element);
+
+    prepareUpcomingMedia(element, () => true);
+    element.dispatchEvent(new Event("loadedmetadata"));
+    expect(element.currentTime).toBeCloseTo(6, 3);
+    element.remove();
   });
 });

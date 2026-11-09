@@ -3,7 +3,7 @@ import {
   compositionStyle,
   cssStyleMergeKey,
   deferScriptsUntilFonts,
-  UNCONDITIONAL_CSS_KEY,
+  isAlwaysAppliedStyle,
   headStyleRuns,
   INLINED_FILE_ATTR,
   inlineScriptRuns,
@@ -17,6 +17,7 @@ import {
   planCompositionAssembly,
 } from "./compositionAssembly";
 import { SCENE_FONTS_ATTR, SCENE_PART_ATTR } from "../sceneParts";
+import { stripSdrPngColourTags } from "./pngColourTags";
 import {
   ensureExternalScriptTag,
   readExternalScriptAttributes,
@@ -41,6 +42,7 @@ import {
   splitUrlSuffix,
 } from "@hyperframes/parsers/asset-paths";
 import { CSS_URL_RE, isNonRelativeUrl } from "./assetPaths.js";
+import { rewriteSrcsetUrls } from "./srcset.js";
 import { compileHtml, type MediaDurationProber } from "./htmlCompiler";
 import {
   RUNTIME_BOOTSTRAP_ATTR,
@@ -51,7 +53,7 @@ import {
 } from "./htmlDocument";
 // rewriteSubCompPaths functions are used by inlineSubCompositions (shared module)
 import {
-  buildVariablesByCompScript,
+  emitVariablesByCompScript,
   dedupeFontFaceRules,
   hoistFontFaceRules,
   scopeCssToComposition,
@@ -65,10 +67,12 @@ import { readDeclaredDefaults } from "../runtime/getVariables";
 import {
   ensureExternalLinkTag,
   inlineSubCompositions,
+  isLibraryCopy,
   refuseSwapsReachedByRootScripts,
 } from "./inlineSubCompositions";
 import { isSafePath, resolveWithinProject } from "../safePath.js";
 import { ensureHfIds } from "@hyperframes/parsers/hf-ids";
+import { readTextFile } from "@hyperframes/parsers/asset-resolution";
 import { HF_COLOR_GRADING_ATTR } from "../colorGrading";
 import { assignMediaRenderIds } from "./mediaRenderIds";
 
@@ -117,7 +121,7 @@ function safeReadFile(filePath: string): string | null {
   noteRead(filePath);
   if (!existsSync(filePath)) return null;
   try {
-    return readFileSync(filePath, "utf-8");
+    return readTextFile(filePath);
   } catch {
     return null;
   }
@@ -179,39 +183,6 @@ function rebaseRelativePath(urlValue: string, fromDir: string, toDir: string): s
   const absolutePath = resolveRelativeUrlPath(fromDir, basePath);
   const rebased = encodeUrlPath(relative(resolve(toDir), absolutePath).split(sep).join("/"));
   return appendSuffixToUrl(rebased, suffix);
-}
-
-function rewriteSrcsetUrls(srcset: string, rewriteUrl: (url: string) => string): string {
-  const parts: string[] = [];
-  let position = 0;
-  let written = 0;
-
-  // Preserve URL commas per https://html.spec.whatwg.org/multipage/images.html#parse-a-srcset-attribute
-  while (position < srcset.length) {
-    while (position < srcset.length && /[ \t\n\r\f,]/.test(srcset.charAt(position))) position++;
-    const start = position;
-    while (position < srcset.length && !/[ \t\n\r\f]/.test(srcset.charAt(position))) position++;
-    let end = position;
-    while (end > start && srcset.charAt(end - 1) === ",") end--;
-    if (end > start) {
-      const url = srcset.slice(start, end);
-      const rewritten = rewriteUrl(url);
-      if (rewritten !== url) {
-        parts.push(srcset.slice(written, start), rewritten);
-        written = end;
-      }
-    }
-    if (end < position) continue;
-
-    let inParens = false;
-    while (position < srcset.length) {
-      const char = srcset.charAt(position++);
-      if (char === "(") inParens = true;
-      else if (char === ")") inParens = false;
-      else if (char === "," && !inParens) break;
-    }
-  }
-  return parts.length > 0 ? parts.join("") + srcset.slice(written) : srcset;
 }
 
 function rebaseColorGradingLutPath(value: string, fromDir: string, toDir: string): string {
@@ -283,7 +254,7 @@ function inlineCssFile(
   css: string,
   cssFileDir: string,
   projectDir: string,
-  visited: Set<string> = new Set(),
+  activeImports: Set<string>,
 ): string {
   const { result: strippedCss, restore: restoreComments } = withCommentsStripped(css, (s) => s);
   const importPlaceholders: string[] = [];
@@ -296,11 +267,12 @@ function inlineCssFile(
       // @import is resolved relative to the CSS file, but must stay within the
       // project root; isSafePath also blocks symlink escapes (content is inlined).
       if (!isSafePath(projectDir, resolved)) return full;
-      if (visited.has(resolved)) return "";
+      if (activeImports.has(resolved)) return "";
       const content = safeReadFile(resolved);
       if (content == null) return full;
-      visited.add(resolved);
-      const inlined = inlineCssFile(content, dirname(resolved), projectDir, visited);
+      activeImports.add(resolved);
+      const inlined = inlineCssFile(content, dirname(resolved), projectDir, activeImports);
+      activeImports.delete(resolved);
       const trimmedMedia = (mediaQuery || "").trim();
       const block = trimmedMedia ? `@media ${trimmedMedia} {\n${inlined}\n}\n` : inlined + "\n";
       const idx = importPlaceholders.length;
@@ -422,7 +394,8 @@ function createAssetInliner(
     // just to be discarded.
     const byteLength = safeStatSize(filePath);
     if (byteLength !== null && byteLength > MAX_INLINE_ASSET_BYTES) return { tooLarge: byteLength };
-    const content = safeReadFileBuffer(filePath);
+    const read = safeReadFileBuffer(filePath);
+    const content = read && mimeType === "image/png" ? (stripSdrPngColourTags(read) ?? read) : read;
     return {
       dataUrl: content === null ? null : `data:${mimeType};base64,${content.toString("base64")}`,
     };
@@ -455,7 +428,8 @@ function createAssetInliner(
       return null;
     }
     inlinedChars += asset.dataUrl.length;
-    return appendSuffixToUrl(asset.dataUrl, suffix);
+    const hashIdx = suffix.indexOf("#");
+    return hashIdx < 0 ? asset.dataUrl : `${asset.dataUrl}${suffix.slice(hashIdx)}`;
   };
 }
 
@@ -752,10 +726,6 @@ function placeSceneStylesLikeRender(document: Document): void {
   const holder = document.createElement("style");
   holder.textContent = hoisted;
   first.before(holder);
-}
-
-function isAlwaysAppliedStyle(el: Element): boolean {
-  return cssStyleMergeKey(el) === UNCONDITIONAL_CSS_KEY && !el.closest("template, noscript, svg");
 }
 
 type PartRun<T> = { scene?: string; chunks: T[] };
@@ -1100,7 +1070,7 @@ async function bundleProject(projectDir: string, options?: BundleOptions): Promi
     throw new Error(`${entryFile} not found in project directory`);
   }
   noteRead(indexPath);
-  const entryHtml = readFileSync(indexPath, "utf-8");
+  const entryHtml = readTextFile(indexPath);
   const mountedShell = readMountedSceneShell(projectDir, entryFile, entryHtml);
   const sourceDir = mountedShell ? projectDir : dirname(indexPath);
   // Every mount of a sub-composition asks again for each of its url()s; isSafePath realpaths the whole chain.
@@ -1135,7 +1105,11 @@ async function bundleProject(projectDir: string, options?: BundleOptions): Promi
   const compiled = await compileHtml(rawHtml, sourceDir, options?.probeMediaDuration);
 
   if (options?.staticGuard !== false && !mountedShell) {
-    const staticGuard = await validateHyperframeHtmlContract(compiled);
+    const entryRel = relative(projectDir, indexPath).replace(/\\/g, "/");
+    const staticGuard = await validateHyperframeHtmlContract(compiled, {
+      dir: projectDir,
+      ...(entryRel !== "index.html" && { compSrcPath: entryRel }),
+    });
     if (!staticGuard.isValid) {
       console.warn(
         `[StaticGuard] Invalid HyperFrame contract: ${staticGuard.missingKeys.join("; ")}`,
@@ -1163,7 +1137,7 @@ async function bundleProject(projectDir: string, options?: BundleOptions): Promi
       const value = el.getAttribute(name);
       if (value !== null) style.setAttribute(name, value);
     }
-    style.textContent = inlineCssFile(css, dirname(cssPath), projectDir);
+    style.textContent = inlineCssFile(css, dirname(cssPath), projectDir, new Set([cssPath]));
     el.replaceWith(style);
   }
 
@@ -1177,7 +1151,8 @@ async function bundleProject(projectDir: string, options?: BundleOptions): Promi
       ].map((el) => {
         const src = el.getAttribute("src");
         const path = src && isRelativeUrl(src) ? resolveEntryUrl(src) : null;
-        return src ? (path && safeReadFile(path)) || "" : el.textContent || "";
+        const text = src ? (path && safeReadFile(path)) || "" : el.textContent || "";
+        return isLibraryCopy(text) ? "" : text;
       })
     : [];
 
@@ -1216,6 +1191,10 @@ async function bundleProject(projectDir: string, options?: BundleOptions): Promi
     },
     flattenInnerRoot: prepareFlattenedInnerRoot,
     tagScenes: options?.sceneParts === true,
+    readProjectScript: (path: string) => {
+      const resolved = isRelativeUrl(path) ? resolveEntryUrl(path) : null;
+      return resolved ? safeReadFile(resolved) : null;
+    },
     readVariableDefaults: readDeclaredDefaults,
     parseHostVariables: parseHostVariableValues,
     buildScopeSelector: (compId: string) => cssAttributeSelector("data-composition-id", compId),
@@ -1239,6 +1218,10 @@ async function bundleProject(projectDir: string, options?: BundleOptions): Promi
     ...subCompResult.variablesByComp,
   };
   const seenCompScriptSrcs = new Set<string>();
+  const scenesBySrc = new Map<string, Set<string | undefined>>();
+  for (const item of subCompResult.scriptItems)
+    if (item.kind !== "inline")
+      scenesBySrc.set(item.src, (scenesBySrc.get(item.src) ?? new Set()).add(item.scene));
   for (const scriptItem of subCompResult.scriptItems) {
     if (scriptItem.kind === "inline") {
       pushRun(scriptRuns, scriptItem.scene, scriptItem.content);
@@ -1252,13 +1235,15 @@ async function bundleProject(projectDir: string, options?: BundleOptions): Promi
     }
     if (seenCompScriptSrcs.has(extSrc)) continue;
     seenCompScriptSrcs.add(extSrc);
+    // Run once for the film when scenes share it: a scene mounts without the one that loaded it first.
+    const scene = (scenesBySrc.get(extSrc)?.size ?? 0) > 1 ? undefined : scriptItem.scene;
     if (isRelativeUrl(extSrc) && scriptItem.type !== "module") {
       const jsPath = resolveEntryUrl(extSrc);
       const js = jsPath ? safeReadFile(jsPath) : null;
       if (js != null) {
         const chunk = () =>
           preserveLocalScriptIntegrity(document, extSrc, resolveEntryUrl) ? "" : js;
-        pushRun(scriptRuns, scriptItem.scene, chunk);
+        pushRun(scriptRuns, scene, chunk);
         continue;
       }
     }
@@ -1415,11 +1400,7 @@ async function bundleProject(projectDir: string, options?: BundleOptions): Promi
 
   for (const css of compStyleChunks) pushRun(styleRuns, undefined, css);
   for (const chunk of compScriptChunks) pushRun(scriptRuns, undefined, chunk);
-  const variablesByCompScript = buildVariablesByCompScript(compVariablesByComp);
-  if (variablesByCompScript) {
-    if (scriptRuns[0] && !scriptRuns[0].scene) scriptRuns[0].chunks.unshift(variablesByCompScript);
-    else scriptRuns.unshift({ chunks: [variablesByCompScript] });
-  }
+  emitVariablesByCompScript(document, compVariablesByComp);
   for (const { scene, chunks } of styleRuns) {
     const join = scene ? joinCssHoistingImports : (css: string[]) => css.join("\n\n");
     for (const style of styleElementsFor(document, chunks, join)) {

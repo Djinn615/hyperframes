@@ -1071,6 +1071,25 @@ describe("loadCompositions external hosts", () => {
       });
     });
 
+    it("binds the scene's variable text before its scripts run", async () => {
+      const host = appendExternalHost("https://example.com/card.html", "card-1");
+      host.setAttribute("data-variable-values", '{"title":"Pro"}');
+      const compositionHtml =
+        `<html data-composition-variables='[{"id":"title","type":"string","label":"Title","default":"Default"}]'>` +
+        `<body><div data-composition-id="card-1"><h1 id="t" data-var-text="title">Default</h1></div>` +
+        `<script>var t = document.getElementById("t"); t.setAttribute("data-seen", t.textContent);</scr` +
+        `ipt></body></html>`;
+      vi.spyOn(globalThis, "fetch").mockResolvedValue(
+        new Response(compositionHtml, { status: 200 }),
+      );
+
+      await loadFixture();
+
+      await vi.waitFor(() =>
+        expect(host.querySelector("#t")?.getAttribute("data-seen")).toBe("Pro"),
+      );
+    });
+
     it("does not redefine a CSS variable already authored on the host", async () => {
       const style = document.createElement("style");
       style.textContent = ":root { --accent: #4287f5; }";
@@ -1898,5 +1917,24 @@ describe("namespaceMountedSvgIds", () => {
     const outerG = [...host("outer").querySelectorAll("g")].find((g) => !inner.contains(g))!;
     const outerClip = clipTarget(outerG);
     expect(host("outer").contains(outerClip) && !inner.contains(outerClip)).toBe(true);
+  });
+
+  // fails without the fix: the second scene's clip-path resolved to the first scene's clipPath.
+  it("resolves each top-level scene clip to its own clipPath, and a shared page-level one for both", async () => {
+    const scene = (start: number) =>
+      `<div class="scene" data-start="${start}" data-duration="10">${CLIPPED("c")}` +
+      `<svg><rect class="shared" clip-path="url(#page)"/></svg></div>`;
+    await mountAll(
+      {},
+      `<svg><clipPath id="page"><rect width="1" height="1"/></clipPath></svg>` +
+        `<div data-composition-id="main" data-start="0">${scene(0)}${scene(10)}</div>`,
+    );
+
+    const scenes = [...document.querySelectorAll(".scene")];
+    for (const each of scenes)
+      expect(each.contains(clipTarget(each.querySelector("g")))).toBe(true);
+    expect(scenes[0]!.querySelector("clipPath")!.id).toBe("c");
+    for (const rect of document.querySelectorAll(".shared"))
+      expect(clipTarget(rect)).toBe(document.getElementById("page"));
   });
 });

@@ -1,6 +1,6 @@
 import { setCommandExitCode, requestCliExit } from "../utils/commandResult.js";
 // fallow-ignore-file code-duplication
-import { defineCommand } from "citty";
+import { defineCommand } from "../utils/defineCommand.js";
 import type { Example } from "./_examples.js";
 import { spawn, type ChildProcessByStdio } from "node:child_process";
 import type { Readable } from "node:stream";
@@ -37,7 +37,7 @@ import { existsSync, lstatSync, mkdirSync, readlinkSync, symlinkSync, unlinkSync
 import { resolve, dirname, basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
-import * as clack from "@clack/prompts";
+import * as clack from "../ui/prompts.js";
 import { c } from "../ui/colors.js";
 import { desktopHint, insideHostApp } from "../utils/desktopApp.js";
 import { isDevMode } from "../utils/env.js";
@@ -54,6 +54,7 @@ import { runRenderSetupWorker } from "../utils/cancellableProcess.js";
 import { formatLintStartupMessage } from "../utils/lintFormat.js";
 import {
   activeServerOnPort,
+  closeServer,
   findPortAndServe,
   scanActiveServers,
   killActiveServers,
@@ -80,6 +81,7 @@ import {
   type PreviewLifecycleSession,
 } from "./previewLifecycleOutput.js";
 import { resolveLocalBrowserGpuMode, type BrowserGpuMode } from "../browser/gpuPolicy.js";
+import { parsePort } from "../utils/port.js";
 
 interface BrowserLaunchOptions {
   noOpen?: boolean;
@@ -316,7 +318,9 @@ export default defineCommand({
       try {
         const project = args.json ? resolveProjectOrThrow(args.dir) : resolveProject(args.dir);
         if (args.stop) {
-          const stopped = await stopBackgroundPreview(project.dir, startPort);
+          const stopped = await stopBackgroundPreview(project.dir, startPort, {
+            preferredPort: explicitPort,
+          });
           if (args.json) {
             writeLifecycleJson(
               lifecyclePayload(
@@ -335,7 +339,9 @@ export default defineCommand({
           }
           return;
         }
-        const status = await readBackgroundPreviewStatus(project.dir, startPort);
+        const status = await readBackgroundPreviewStatus(project.dir, startPort, {
+          preferredPort: explicitPort,
+        });
         if (!status) {
           if (args.json) {
             writeLifecycleJson(
@@ -355,7 +361,7 @@ export default defineCommand({
               "status",
               previewLifecycleSession({
                 state: "running",
-                mode: "background",
+                mode: status.logPath ? "background" : "unknown",
                 projectName: project.name,
                 projectDir: project.dir,
                 port: status.port,
@@ -367,7 +373,11 @@ export default defineCommand({
           return;
         }
         printStudioSummary(project.name, previewBaseUrl(status.port), project.dir, {
-          details: [`Background preview running (PID ${status.pid}).`, `Log: ${status.logPath}`],
+          preview: status.logPath ? "background" : "foreground",
+          details: [
+            `${status.logPath ? "Background preview" : "Preview"} running${status.pid === null ? "" : ` (PID ${status.pid})`}.`,
+            ...(status.logPath ? [`Log: ${status.logPath}`] : []),
+          ],
         });
         return;
       } catch (error) {
@@ -547,6 +557,7 @@ export default defineCommand({
       } else {
         clack.intro(c.bold("hyperframes preview"));
         printStudioSummary(projectName, url, dir, {
+          preview: "background",
           details: [
             background.type === "reused"
               ? "Reusing the background server already running for this project."
@@ -618,7 +629,7 @@ async function printStartupLint(dir: string, verbose: boolean): Promise<void> {
   try {
     const lintResult = await runRenderSetupWorker<ProjectLintResult>(
       "lint",
-      { projectDir: dir },
+      { projectDir: dir, background: true },
       { maxBufferBytes: 8 * 1024 * 1024 },
     );
     if (lintResult.totalErrors === 0 && lintResult.totalWarnings === 0) return;
@@ -686,10 +697,12 @@ export function previewLaunchModeError(options: {
 }
 
 export function previewPortError(port: string | undefined): string | null {
-  const value = port ?? "3002";
-  if (!/^\d+$/.test(value)) return "--port must be an integer between 1 and 65535";
-  const parsed = Number(value);
-  return parsed >= 1 && parsed <= 65535 ? null : "--port must be an integer between 1 and 65535";
+  try {
+    parsePort(port ?? "3002");
+    return null;
+  } catch (error) {
+    return errorMessage(error);
+  }
 }
 
 export function publicPreviewPid(
@@ -728,17 +741,27 @@ export async function handlePreviewList(
       (dependencies.scan ?? scanActiveServers)(startPort),
       (dependencies.listManaged ?? listBackgroundPreviewStatuses)(),
     ]);
+    const listedSessions = managedSessions.filter(
+      (session) =>
+        session.pid !== null ||
+        !scannedServers.some(
+          (server) =>
+            publicPreviewPid(server.pid, null) !== null &&
+            server.port === session.port &&
+            resolve(server.projectDir) === resolve(session.projectDir),
+        ),
+    );
     const managedKeys = new Set(
-      managedSessions.map((session) => `${resolve(session.projectDir)}\0${session.port}`),
+      listedSessions.map((session) => `${resolve(session.projectDir)}\0${session.port}`),
     );
     const servers = [
-      ...managedSessions.map((session) => ({
+      ...listedSessions.map((session) => ({
         port: session.port,
         host: "127.0.0.1",
         projectName: basename(session.projectDir),
         projectDir: session.projectDir,
-        version: "managed",
-        pid: String(session.pid),
+        version: session.logPath ? "managed" : "unknown",
+        pid: session.pid === null ? null : String(session.pid),
       })),
       ...scannedServers.filter(
         (server) => !managedKeys.has(`${resolve(server.projectDir)}\0${server.port}`),
@@ -1302,14 +1325,14 @@ function printStudioSummary(
   projectName: string,
   serverUrl: string,
   projectDir: string,
-  opts: { details?: string[]; footer?: string } = {},
+  opts: { details?: string[]; footer?: string; preview?: "background" | "foreground" } = {},
 ): void {
   const urls = studioSummaryUrls(projectName, serverUrl);
   console.log();
   console.log(`  ${c.dim("Project")}   ${c.accent(projectName)}`);
   console.log(`  ${c.dim("Studio")}    ${c.accent(urls.studioUrl)}`);
   console.log(`  ${c.dim("Server")}    ${c.accent(urls.serverUrl)}`);
-  const hint = desktopHint(projectDir);
+  const hint = desktopHint(projectDir, { preview: opts.preview });
   if (hint) console.log(`  ${c.dim("Desktop")}   ${hint}`);
   console.log();
   for (const detail of opts.details ?? []) {
@@ -1418,6 +1441,7 @@ function attachStudioReadyHandler(
     } else {
       spinner.stop(c.success("Studio running"));
       printStudioSummary(projectName, url, projectDir, {
+        preview: "foreground",
         footer: "Press Ctrl+C to stop",
       });
     }
@@ -1674,6 +1698,7 @@ export async function runEmbeddedMode(
       console.log();
     }
     printStudioSummary(pName, url, dir, {
+      preview: "foreground",
       details: [
         "Edit with your AI agent — it has HyperFrames skills installed.",
         "Changes reload automatically in the studio.",
@@ -1723,7 +1748,7 @@ export async function runEmbeddedMode(
         .catch(() => {})
         .finally(() => {
           watcher.close();
-          result.server.close(() => resolveRun());
+          void closeServer(result.server).then(resolveRun);
         });
     };
     // `on`, not `once`: a repeat Ctrl+C/SIGTERM while shutdown is running must

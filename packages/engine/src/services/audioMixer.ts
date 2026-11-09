@@ -1,10 +1,16 @@
 // fallow-ignore-file complexity code-duplication
 import { isSelfOrAncestorHidden, memberGroupKey, isMemberGroupHidden } from "./mediaHidden.js";
 import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, rmSync, writeFileSync } from "fs";
-import { renameWithRetry } from "../utils/renameWithRetry.js";
+import { renameWithRetry } from "@hyperframes/core/rename-retry";
+import { removeScratch } from "@hyperframes/core/remove-scratch";
 import { join, dirname, isAbsolute, relative } from "path";
 import { parseHTML } from "linkedom";
-import { extractAudioMetadata, type AudioMetadata } from "../utils/ffprobe.js";
+import {
+  extractAudioMetadata,
+  ffmpegSeekSeconds,
+  formatFfmpegSeconds,
+  type AudioMetadata,
+} from "../utils/ffprobe.js";
 import { isNotMediaPayload } from "../utils/notMediaPayload.js";
 import { urlInputArgs } from "../utils/urlInput.js";
 import { clampAudioGain, clipGain } from "@hyperframes/core/audio-gain";
@@ -129,11 +135,12 @@ function buildRampFilterComplex(
   duration: number,
   headFilter: string | null,
   tailFilter: string | null,
+  input: string,
 ): string {
   const slices = Math.min(MAX_RAMP_SLICES, Math.max(1, Math.ceil(duration / RAMP_SLICE_SECONDS)));
   const step = duration / slices;
   const split = Array.from({ length: slices }, (_, i) => `[s${i}]`).join("");
-  const parts = [`[0:a]${headFilter ? `${headFilter},` : ""}asplit=${slices}${split}`];
+  const parts = [`[${input}]${headFilter ? `${headFilter},` : ""}asplit=${slices}${split}`];
   for (let i = 0; i < slices; i += 1) {
     const from = sourceTimeAt(lane, i * step);
     const to = sourceTimeAt(lane, (i + 1) * step);
@@ -159,16 +166,23 @@ function preparedAudioOutputArgs(
   playbackRate: RateSpec,
   duration: number,
   headFilter: string | null,
+  stream: string | null,
 ): string[] {
   const channelFilter = metadata?.channels === 1 ? STEREO_CHANNEL_FILTER : null;
   const outputArgs = channelFilter ? [] : ["-ac", "2"];
   if (typeof playbackRate === "object") {
-    const graph = buildRampFilterComplex(playbackRate, duration, headFilter, channelFilter);
+    const graph = buildRampFilterComplex(
+      playbackRate,
+      duration,
+      headFilter,
+      channelFilter,
+      stream ?? "0:a",
+    );
     return ["-filter_complex", graph, "-map", "[out]", ...outputArgs];
   }
   const filters = [headFilter, channelFilter, buildAtempoFilter(playbackRate)].filter(Boolean);
   if (filters.length > 0) outputArgs.push("-af", filters.join(","));
-  return outputArgs;
+  return [...(stream ? ["-map", stream] : []), ...outputArgs];
 }
 
 function escapeExpressionCommas(expression: string): string {
@@ -463,7 +477,7 @@ function ffmpegFailure(
   } else if (result.terminationReason === "abort") {
     reason = "cancelled";
     owner = "user";
-  } else if (result.terminationReason === "deadline" || result.terminationReason === "inactivity") {
+  } else if (result.terminationReason === "inactivity") {
     reason = "ffmpeg_timeout";
     retryable = true;
   } else if (result.terminationReason === "spawn_error") {
@@ -555,6 +569,10 @@ export function volumeLaneKeyframes(
  */
 export function parseMasterFxChain(html: string): string | undefined {
   return readMasterFxChain(parseHTML(unwrapTemplate(html)).document);
+}
+
+export function videoAudioId(videoId: string): string {
+  return `${videoId}-audio`;
 }
 
 export function parseAudioElements(html: string): AudioElement[] {
@@ -656,7 +674,7 @@ export function parseAudioElements(html: string): AudioElement[] {
     const src = resolveMediaElementSrc(el);
     if (!id || !src || isHidden(el) || memberGroupHidden(el)) continue;
     if (isKnownInactiveTimelineWindow(el, resolveStart(el))) continue;
-    elements.push(build(el, `${id}-audio`, src, "video", true));
+    elements.push(build(el, videoAudioId(id), src, "video", true));
   }
 
   return elements;
@@ -714,13 +732,19 @@ async function extractAudioSegment(
         { padToDuration: true },
       );
       if (!cycle.success) return { ...cycle, outputPath };
-      const outputArgs = preparedAudioOutputArgs(metadata, normalizedPlaybackRate, duration, null);
+      const outputArgs = preparedAudioOutputArgs(
+        metadata,
+        normalizedPlaybackRate,
+        duration,
+        null,
+        null,
+      );
       const result = await runFfmpeg(
         [
           "-stream_loop",
           "-1",
           "-t",
-          String(sourceDuration),
+          formatFfmpegSeconds(sourceDuration),
           "-i",
           cyclePath,
           "-vn",
@@ -730,7 +754,7 @@ async function extractAudioSegment(
           "48000",
           ...outputArgs,
           "-t",
-          String(duration),
+          formatFfmpegSeconds(duration),
           "-y",
           outputPath,
         ],
@@ -747,16 +771,17 @@ async function extractAudioSegment(
         failure,
       };
     } finally {
-      rmSync(cycleDir, { recursive: true, force: true });
+      removeScratch(cycleDir);
     }
   }
-  const inputSeek = mediaStart >= (metadata?.latestStreamLeadSeconds ?? 0);
-  const start = formatFilterNumber(mediaStart);
+  const ffmpegStart = ffmpegSeekSeconds(metadata ?? {}, mediaStart);
+  const inputSeek = ffmpegStart >= (metadata?.latestStreamLeadSeconds ?? 0);
+  const start = formatFilterNumber(ffmpegStart);
   const timestampTrim = inputSeek
     ? null
-    : `atrim=start=${start}:end=${formatFilterNumber(mediaStart + sourceDuration)},asetpts=PTS-${start}/TB,aresample=async=1:first_pts=0`;
+    : `atrim=start=${start}:end=${formatFilterNumber(ffmpegStart + sourceDuration)},asetpts=PTS-${start}/TB,aresample=async=1:first_pts=0`;
   const fromSidecar = audioSidecarUrl !== undefined && inputSeek && normalizedPlaybackRate === 1;
-  const warmUp = fromSidecar ? Math.min(SIDECAR_WARM_UP_SECONDS, mediaStart) : 0;
+  const warmUp = fromSidecar ? Math.min(SIDECAR_WARM_UP_SECONDS, ffmpegStart) : 0;
   const outputArgs = preparedAudioOutputArgs(
     metadata,
     normalizedPlaybackRate,
@@ -767,6 +792,7 @@ async function extractAudioSegment(
     ]
       .filter(Boolean)
       .join(",") || null,
+    metadata ? `0:a:${metadata.audioStream}` : null,
   );
   const readFrom = fromSidecar ? audioSidecarUrl : srcPath;
 
@@ -774,13 +800,19 @@ async function extractAudioSegment(
     ...(readsUrl ? FAIL_ON_READ_ERROR_INSTEAD_OF_ENDING_THERE : []),
     ...urlInputArgs(readFrom),
     ...(inputSeek
-      ? ["-ss", String(mediaStart - warmUp), "-t", String(sourceDuration + warmUp)]
+      ? [
+          "-ss",
+          formatFfmpegSeconds(ffmpegStart - warmUp),
+          "-t",
+          formatFfmpegSeconds(sourceDuration + warmUp),
+        ]
       : []),
     "-i",
     readFrom,
   ];
   args.push("-vn", "-acodec", "pcm_s16le", "-ar", "48000", ...outputArgs);
-  if (normalizedPlaybackRate !== 1 || options?.padToDuration) args.push("-t", String(duration));
+  if (normalizedPlaybackRate !== 1 || options?.padToDuration)
+    args.push("-t", formatFfmpegSeconds(duration));
   args.push("-y", outputPath);
 
   const result = await runFfmpeg(args, { signal, timeout: ffmpegProcessTimeout });
@@ -849,7 +881,7 @@ async function generateSilence(
     "-i",
     "anullsrc=r=48000:cl=stereo",
     "-t",
-    String(duration),
+    formatFfmpegSeconds(duration),
     "-acodec",
     "pcm_s16le",
     "-y",
@@ -886,17 +918,6 @@ async function generateSilence(
   };
 }
 
-/** A mix graph's work grows with the film length (about 11 ms per film second at 96 inputs); so does its deadline. */
-const MIX_TIMEOUT_MS_PER_FILM_SECOND = 100;
-
-function mixProcessTimeout(
-  config: Partial<Pick<EngineConfig, "ffmpegProcessTimeout">> | undefined,
-  totalDuration: number,
-): number {
-  const configured = config?.ffmpegProcessTimeout ?? DEFAULT_CONFIG.ffmpegProcessTimeout;
-  return Math.max(configured, Math.ceil(totalDuration * MIX_TIMEOUT_MS_PER_FILM_SECOND));
-}
-
 async function mixAudioTracksFlat(
   tracks: AudioTrack[],
   outputPath: string,
@@ -904,7 +925,7 @@ async function mixAudioTracksFlat(
   signal?: AbortSignal,
   config?: Partial<Pick<EngineConfig, "ffmpegProcessTimeout" | "audioGain">>,
 ): Promise<MixResult> {
-  const ffmpegProcessTimeout = mixProcessTimeout(config, totalDuration);
+  const ffmpegProcessTimeout = config?.ffmpegProcessTimeout ?? DEFAULT_CONFIG.ffmpegProcessTimeout;
   const masterOutputGain = config?.audioGain ?? DEFAULT_CONFIG.audioGain;
 
   if (tracks.length === 0) {
@@ -973,7 +994,7 @@ async function mixAudioTracksFlat(
       "-ar",
       "48000",
       "-t",
-      String(totalDuration),
+      formatFfmpegSeconds(totalDuration),
       "-y",
       outputPath,
     ];
@@ -986,7 +1007,7 @@ async function mixAudioTracksFlat(
       currentArgs[currentArgs.indexOf("-filter_complex_script")] = "-/filter_complex";
       return await runFfmpeg(currentArgs, { signal, timeout: ffmpegProcessTimeout });
     } finally {
-      rmSync(scriptDir, { recursive: true, force: true });
+      removeScratch(scriptDir);
     }
   };
 
@@ -1103,7 +1124,7 @@ async function mixGroupMembersFlat(
   | { success: true; degradedAutomation?: boolean }
   | { success: false; error: string; failure: AudioProcessingFailure }
 > {
-  const ffmpegProcessTimeout = mixProcessTimeout(config, totalDuration);
+  const ffmpegProcessTimeout = config?.ffmpegProcessTimeout ?? DEFAULT_CONFIG.ffmpegProcessTimeout;
   const outputDir = dirname(outputPath);
   if (!existsSync(outputDir)) mkdirSync(outputDir, { recursive: true });
 
@@ -1158,7 +1179,7 @@ async function mixGroupMembersFlat(
         "-ar",
         "48000",
         "-t",
-        String(totalDuration),
+        formatFfmpegSeconds(totalDuration),
         "-y",
         outputPath,
       ];
@@ -1170,7 +1191,7 @@ async function mixGroupMembersFlat(
       currentArgs[currentArgs.indexOf("-filter_complex_script")] = "-/filter_complex";
       return await runFfmpeg(currentArgs, { signal, timeout: ffmpegProcessTimeout });
     } finally {
-      rmSync(scriptDir, { recursive: true, force: true });
+      removeScratch(scriptDir);
     }
   };
 
@@ -1256,8 +1277,8 @@ async function sumInSlices(
       signal,
       config,
     );
-    rmSync(running.srcPath, { force: true });
-    rmSync(slicePath, { force: true });
+    removeScratch(running.srcPath);
+    removeScratch(slicePath);
     if (!folded.success) return folded;
     running = wavTrack(id, foldedPath);
   }
@@ -1280,10 +1301,10 @@ async function mixGroupMembers(
   try {
     const summed = await sumInSlices(memberTracks, scratchDir, totalDuration, signal, config);
     if (!summed.success) return summed;
-    renameWithRetry(summed.track.srcPath, outputPath);
+    renameWithRetry(summed.track.srcPath, outputPath, { copyFallback: true });
     return { success: true, degradedAutomation: summed.degradedAutomation };
   } finally {
-    rmSync(scratchDir, { recursive: true, force: true });
+    removeScratch(scratchDir);
   }
 }
 
@@ -1328,7 +1349,7 @@ async function mixAudioTracks(
         }
       : mixed;
   } finally {
-    rmSync(scratchDir, { recursive: true, force: true });
+    removeScratch(scratchDir);
   }
 }
 
@@ -1381,7 +1402,8 @@ async function mixThroughFloatSum(
       failures: [failure],
     };
   }
-  if (config?.keepEncoderInputAt) renameWithRetry(encoderInput, config.keepEncoderInputAt);
+  if (config?.keepEncoderInputAt)
+    renameWithRetry(encoderInput, config.keepEncoderInputAt, { copyFallback: true });
   return {
     ...sum,
     outputPath,

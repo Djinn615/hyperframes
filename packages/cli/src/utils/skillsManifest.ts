@@ -92,9 +92,12 @@ export interface SkillsCheckResult {
   skills: SkillDiff[];
   /** Manifest-named skills the lock attributes to another publisher; left untouched. */
   foreign: string[];
+  /** Repo ref the manifest was read at; an install for this result must use the same one. */
+  ref: string | null;
 }
 
 const DEFAULT_REPO_SLUG = "heygen-com/hyperframes";
+const REPO_SLUG_PATTERN = /^[\w.-]+\/[\w.-]+$/;
 /** Manifest filename, published at the repo root. */
 export const MANIFEST_FILE = "skills-manifest.json";
 const FETCH_TIMEOUT_MS = 4000;
@@ -108,8 +111,8 @@ const FETCH_TIMEOUT_MS = 4000;
 //              structurally (sibling `../hyperframes/references/…` paths,
 //              "call /media-use" preambles). These must be present and current
 //              for any video work, so `init` / `skills update` keep them fresh.
-//   on-demand — everything else: decks (slideshow), Remotion ports
-//              (remotion-to-hyperframes) and optional integrations (figma).
+//   on-demand — everything else: decks, Remotion ports, video rebuilds
+//              (reverse-any-video, style-sampling) and optional integrations (figma).
 //              They install when named (`hyperframes skills update <name>`),
 //              instead of being sprayed onto every machine that runs `init`.
 
@@ -389,6 +392,14 @@ function locateInstall(
   return null;
 }
 
+function globalInstallRoot(home = homedir()): SkillRoot {
+  return {
+    dir: join(process.env.CLAUDE_CONFIG_DIR?.trim() || join(home, ".claude"), "skills"),
+    agent: "claude-code",
+    scope: "global",
+  };
+}
+
 /**
  * Names from `skillNames` that are present (their SKILL.md exists) in the
  * located install. Local-only — no manifest fetch — so callers can verify the
@@ -396,9 +407,11 @@ function locateInstall(
  */
 export function presentSkills(
   skillNames: readonly string[],
-  opts: { dir?: string; cwd?: string; home?: string } = {},
+  opts: { dir?: string; cwd?: string; home?: string; installTarget?: boolean } = {},
 ): string[] {
-  const root = locateInstall([...skillNames], opts);
+  const root = opts.installTarget
+    ? globalInstallRoot(opts.home)
+    : locateInstall([...skillNames], opts);
   if (!root) return [];
   return skillNames.filter((name) => existsSync(join(root.dir, name, "SKILL.md")));
 }
@@ -546,6 +559,17 @@ export function hyperframesSkillNames(opts: {
   return skillsAttributedToSource(readSkillLock(lockPath), DEFAULT_REPO_SLUG);
 }
 
+export function foreignSkillNames(opts: {
+  scope: "project" | "global";
+  cwd?: string;
+  home?: string;
+}): string[] {
+  const lock = readSkillLock(lockPathForScope(opts.scope, opts));
+  return Object.entries(lock?.skills ?? {})
+    .filter(([, entry]) => isFromOtherSource(entry, DEFAULT_REPO_SLUG))
+    .map(([name]) => name);
+}
+
 // ── Resolving the "latest" manifest ──────────────────────────────────────────
 
 /** Walk up from `cwd` to find a repo checkout that ships the manifest. */
@@ -575,12 +599,21 @@ function asSkillsManifest(data: unknown, sourceLabel: string): SkillsManifest {
   return m as SkillsManifest;
 }
 
+/** A manifest fetch the server answered with an error status (404: no such ref). */
+class ManifestHttpError extends Error {
+  readonly status: number;
+  constructor(status: number, url: string) {
+    super(`HTTP ${status} fetching ${url}`);
+    this.status = status;
+  }
+}
+
 async function fetchManifest(url: string): Promise<SkillsManifest> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
   try {
     const res = await fetch(url, { signal: controller.signal, headers: { Connection: "close" } });
-    if (!res.ok) throw new Error(`HTTP ${res.status} fetching ${url}`);
+    if (!res.ok) throw new ManifestHttpError(res.status, url);
     return asSkillsManifest(await res.json(), url);
   } finally {
     clearTimeout(timeout);
@@ -588,19 +621,35 @@ async function fetchManifest(url: string): Promise<SkillsManifest> {
 }
 
 /**
- * Resolve main's live HEAD sha via `git ls-remote`. GitHub's branch-raw CDN
- * (raw.githubusercontent.com/<owner>/<repo>/main/...) can serve stale content
- * for minutes after a push; a SHA-pinned raw URL is immediately consistent.
- * Returns null when git/network is unavailable so callers fall back to main.
+ * Resolve main's live HEAD sha via `git ls-remote`: the branch-raw CDN can serve
+ * stale content for minutes after a push, a SHA-pinned raw URL cannot. Returns
+ * null for a slug that is not `owner/repo`, or when git/network is unavailable.
+ *
+ * GIT_TERMINAL_PROMPT=0 does not stop credential helpers or askpass, and Git
+ * Credential Manager (the Git for Windows default) answers a private or missing
+ * repo's auth challenge with a blocking sign-in window. An empty credential.helper
+ * clears every helper; an empty GIT_ASKPASS also skips core.askPass and SSH_ASKPASS.
  */
 async function remoteHeadSha(repoSlug: string): Promise<string | null> {
+  if (!REPO_SLUG_PATTERN.test(repoSlug)) return null;
   try {
     const { stdout } = await execFileAsync(
       "git",
-      ["ls-remote", `https://github.com/${repoSlug}.git`, "refs/heads/main"],
+      [
+        "-c",
+        "credential.helper=",
+        "ls-remote",
+        `https://github.com/${repoSlug}.git`,
+        "refs/heads/main",
+      ],
       {
         timeout: FETCH_TIMEOUT_MS,
-        env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+        env: {
+          ...process.env,
+          GIT_TERMINAL_PROMPT: "0",
+          GIT_ASKPASS: "",
+          GCM_INTERACTIVE: "never",
+        },
         windowsHide: true,
       },
     );
@@ -609,6 +658,11 @@ async function remoteHeadSha(repoSlug: string): Promise<string | null> {
   } catch {
     return null;
   }
+}
+
+/** The release tag (`v<version>`) of a published CLI build; null for a dev or pre-release build. */
+export function cliReleaseTag(version: string): string | null {
+  return /^\d+\.\d+\.\d+$/.test(version) ? `v${version}` : null;
 }
 
 /** Read a manifest from a local path — a manifest file or a repo root. */
@@ -621,15 +675,27 @@ function resolveLocalManifest(source: string): SkillsManifest {
   throw new Error(`No skills manifest found at: ${source}`);
 }
 
-/**
- * Fetch the manifest from GitHub. A full URL is fetched directly; an
- * `owner/repo` slug (or the default repo) is SHA-pinned via `git ls-remote` to
- * dodge raw-CDN lag, falling back to the branch URL when git is unavailable.
- */
-async function fetchRemoteManifest(source?: string): Promise<SkillsManifest> {
-  if (source?.startsWith("http")) return fetchManifest(source);
+/** A manifest and the repo ref it was read at (null for a local file or a URL). */
+interface ResolvedManifest {
+  manifest: SkillsManifest;
+  ref: string | null;
+}
 
-  const repoSlug = source ?? DEFAULT_REPO_SLUG;
+/** The manifest at a release tag; null only when the repo has no such tag (404). */
+async function fetchTagManifest(repoSlug: string, tag: string): Promise<SkillsManifest | null> {
+  try {
+    return await fetchManifest(
+      `https://raw.githubusercontent.com/${repoSlug}/${tag}/${MANIFEST_FILE}`,
+    );
+  } catch (err) {
+    // A timeout or proxy error must not quietly compare against main.
+    if (err instanceof ManifestHttpError && err.status === 404) return null;
+    throw err;
+  }
+}
+
+/** main's manifest, SHA-pinned via `git ls-remote` to dodge raw-CDN lag, else the branch URL. */
+async function fetchMainManifest(repoSlug: string): Promise<SkillsManifest> {
   const sha = await remoteHeadSha(repoSlug);
   if (sha) {
     try {
@@ -641,6 +707,24 @@ async function fetchRemoteManifest(source?: string): Promise<SkillsManifest> {
     }
   }
   return fetchManifest(`https://raw.githubusercontent.com/${repoSlug}/main/${MANIFEST_FILE}`);
+}
+
+/**
+ * Fetch the manifest from GitHub. A full URL is fetched directly; an
+ * `owner/repo` slug is read at the CLI's release tag (publish pushes it before
+ * npm), and at `main` only for a dev build or a tag the repo does not have.
+ */
+async function fetchRemoteManifest(
+  source?: string,
+  cliVersion?: string,
+): Promise<ResolvedManifest> {
+  if (source?.startsWith("http")) return { manifest: await fetchManifest(source), ref: null };
+
+  const repoSlug = source ?? DEFAULT_REPO_SLUG;
+  const tag = cliReleaseTag(cliVersion ?? "");
+  const atTag = tag ? await fetchTagManifest(repoSlug, tag) : null;
+  if (tag && atTag) return { manifest: atTag, ref: tag };
+  return { manifest: await fetchMainManifest(repoSlug), ref: "main" };
 }
 
 /**
@@ -661,18 +745,23 @@ async function fetchRemoteManifest(source?: string): Promise<SkillsManifest> {
 async function resolveLatestManifest(
   source?: string,
   cwd = process.cwd(),
-  opts: { canonical?: boolean } = {},
-): Promise<SkillsManifest> {
+  opts: { canonical?: boolean; cliVersion?: string } = {},
+): Promise<ResolvedManifest> {
   // A local path is a relative one (./ ../) or an absolute one — isAbsolute
   // covers POSIX `/…` and Windows `C:\…` / `\…` on their respective platforms.
   if (source && (source.startsWith(".") || isAbsolute(source))) {
-    return resolveLocalManifest(source);
+    return { manifest: resolveLocalManifest(source), ref: null };
   }
   if (!source && !opts.canonical) {
     const repoManifest = findRepoManifest(cwd);
-    if (repoManifest) return JSON.parse(readFileSync(repoManifest, "utf8")) as SkillsManifest;
+    if (repoManifest) {
+      return {
+        manifest: JSON.parse(readFileSync(repoManifest, "utf8")) as SkillsManifest,
+        ref: null,
+      };
+    }
   }
-  return fetchRemoteManifest(source);
+  return fetchRemoteManifest(source, opts.cliVersion);
 }
 
 /**
@@ -687,18 +776,25 @@ export async function checkSkills(
     home?: string;
     /** See resolveLatestManifest — bypass the in-repo manifest shortcut. */
     canonical?: boolean;
+    /** Read the remote manifest at this CLI version's release tag (see fetchRemoteManifest). */
+    cliVersion?: string;
+    /** Check the global store written by the installer, even before it exists. */
+    installTarget?: boolean;
   } = {},
 ): Promise<SkillsCheckResult> {
-  const latest = await resolveLatestManifest(opts.source, opts.cwd, { canonical: opts.canonical });
+  const { manifest: latest, ref } = await resolveLatestManifest(opts.source, opts.cwd, {
+    canonical: opts.canonical,
+    cliVersion: opts.cliVersion,
+  });
   const skillNames = Object.keys(latest.skills);
-  const root = locateInstall(skillNames, { dir: opts.dir, cwd: opts.cwd, home: opts.home });
+  const root = opts.installTarget ? globalInstallRoot(opts.home) : locateInstall(skillNames, opts);
   // A directory sharing a name with one of ours can belong to another publisher.
   // The lock says so; such a skill is never compared, refreshed or overwritten.
   const lock = root ? readSkillLock(lockPathForScope(root.scope, opts)) : null;
   const foreign = root
     ? skillNames.filter(
         (name) =>
-          existsSync(join(root.dir, name, "SKILL.md")) &&
+          (opts.installTarget || existsSync(join(root.dir, name, "SKILL.md"))) &&
           isFromOtherSource(lock?.skills?.[name], latest.source),
       )
     : [];
@@ -716,5 +812,6 @@ export async function checkSkills(
     summary: diff.summary,
     skills: diff.skills,
     foreign,
+    ref,
   };
 }

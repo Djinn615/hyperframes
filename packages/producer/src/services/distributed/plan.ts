@@ -1,3 +1,9 @@
+import {
+  REFERENCE_BACKGROUND_FIELD,
+  referenceBackgroundResult,
+  createReferenceBackgroundRecorder,
+  type ReferenceBackgroundResult,
+} from "@hyperframes/engine";
 import { audioFailureDiagnostics } from "@hyperframes/engine";
 /**
  * Activity A of the distributed render pipeline.
@@ -47,6 +53,8 @@ import {
   type EngineConfig,
   type VideoFrameFormat,
   getEncoderPreset,
+  type ProresProfile,
+  keyframeIntervalToGopSize,
   normalizeVp9CpuUsed,
   resolveConfig,
   type AudioProcessingFailure,
@@ -62,6 +70,11 @@ import {
 } from "../renderOrchestrator.js";
 import { closeFileServerSafely } from "../fileServer.js";
 import { measurePlanSecondsPerFrame } from "./planFrameCost.js";
+import {
+  buildWeightedChunkSlices,
+  planFrameWeights,
+  withChunkCaptureCost,
+} from "./chunkWeights.js";
 import { runAudioStage } from "../render/stages/audioStage.js";
 import { runCompileStage } from "../render/stages/compileStage.js";
 import {
@@ -69,6 +82,7 @@ import {
   assertVideoExtractionSucceeded,
   runExtractVideosStage,
 } from "../render/stages/extractVideosStage.js";
+import { readPlanReferenceBackground } from "../render/planReferenceBackground.js";
 import { runProbeStage } from "../render/stages/probeStage.js";
 import {
   type ChunkSliceJson,
@@ -150,6 +164,14 @@ export interface DistributedRenderConfig extends Pick<RenderRequestOptions, "pag
   crf?: number;
   /** Target video bitrate (e.g. `"10M"`); mutually exclusive with `crf`. */
   bitrate?: string;
+  /** Longest gap between keyframes, in seconds (mp4). Chunk joins add keyframes, so this is a maximum. */
+  keyframeIntervalSeconds?: number;
+  /** ProRes profile for `format: "mov"`; the 422 profiles have no alpha. Defaults to `4444`. */
+  proresProfile?: ProresProfile;
+  /** Peak bitrate cap (mp4), per chunk. */
+  maxBitrate?: string;
+  /** Rate-cap buffer; defaults to twice `maxBitrate`. */
+  bufferSize?: string;
   /**
    * Source-video frame extraction format. Defaults to `"auto"`, matching the
    * in-process renderer: alpha/alpha-capable sources extract as PNG, other
@@ -199,17 +221,19 @@ export interface DistributedRenderConfig extends Pick<RenderRequestOptions, "pag
    * chunks whose per-chunk frame count stays at or below this bound, still
    * capped by `maxParallelChunks`:
    *
-   *     chunkCount = clamp(ceil(totalFrames / targetChunkFrames), 1, maxParallelChunks)
+   *     chunkCount = clamp(ceil(totalFrames / targetChunkFrames), minParallelChunks, maxParallelChunks)
    *
    * This bounds per-chunk render *time* (which scales with frames-per-chunk) so
    * a single chunk can't exceed a downstream per-chunk timeout on a long video,
-   * while short videos still collapse to few chunks. It is a ceiling, not a
+   * while short videos drop to `minParallelChunks` (default 1). It is a ceiling, not a
    * fixed size: a video short enough to fit in fewer chunks gets fewer. Ignored
    * when `chunkSize` is set (an explicit fixed size already pins per-chunk
    * frames). Mutually exclusive with `chunkSize` in intent; if both are passed,
    * `chunkSize` wins and `targetChunkFrames` is a no-op.
    */
   targetChunkFrames?: number;
+  /** Fewest chunks a `targetChunkFrames`-sized plan uses, so a short video keeps this fan-out. */
+  minParallelChunks?: number;
   /** Runtime hint; consumed by future per-runtime budget checks. The current implementation records the value but does not enforce. */
   runtimeCap?: "lambda" | "temporal" | "cloud-run-job" | "k8s-job" | "none";
 
@@ -287,7 +311,7 @@ export interface DistributedRenderConfig extends Pick<RenderRequestOptions, "pag
 }
 
 /** Shared local representation consumed by both distributed plan transports. */
-export interface LocalExecutionPlan {
+export interface LocalExecutionPlan extends Partial<ReferenceBackgroundResult> {
   executionPlanDir: string;
   executionPlanHash: string;
   chunkCount: number;
@@ -348,7 +372,7 @@ export function logPlanStage(log: ProducerLogger, stage: string, startedAt: numb
  * @deprecated Use `planV2()` or `planV2WithPublisher()` for new integrations.
  * The v1 result remains supported for existing transports.
  */
-export interface PlanResult {
+export interface PlanResult extends Partial<ReferenceBackgroundResult> {
   planDir: string;
   planProtocol: Readonly<PlanProtocolV1Descriptor>;
   planHash: string;
@@ -431,6 +455,8 @@ export const DEFAULT_MAX_PARALLEL_CHUNKS = 16;
  * outweighs the parallelism gain on tiny renders.
  */
 export const MIN_CHUNK_SIZE = 10;
+/** Largest `chunkSize`; `validateDistributedRenderConfig` enforces it, and cost-weighted chunks stay under it. */
+export const MAX_CHUNK_SIZE = 3600;
 /** Most chunks one render may plan; `validateDistributedRenderConfig` enforces it on `maxParallelChunks`. */
 export const MAX_PARALLEL_CHUNKS_CEILING = 256;
 // 0.11 s per megapixel-frame (~0.23 s per 1080p frame) was measured on one simple 1080p fixture on a
@@ -499,6 +525,14 @@ export class ChunkExceedsWorkerTimeoutError extends Error {
   }
 }
 
+/** Frames one chunk can capture inside the worker time limit, after the per-chunk overhead. */
+function framesWithinWorkerTimeout(workerTimeoutSeconds: number, secondsPerFrame: number): number {
+  return Math.floor(
+    (workerTimeoutSeconds * WORKER_TIMEOUT_MARGIN - ESTIMATED_CHUNK_OVERHEAD_SECONDS) /
+      secondsPerFrame,
+  );
+}
+
 /**
  * The `maxParallelChunks` a plan uses: an explicit value, else one wave across `workerConcurrency`
  * (16 if unknown), widened to fit `workerTimeoutSeconds` unless chunkSize/targetChunkFrames pin it.
@@ -531,10 +565,7 @@ export function resolveMaxParallelChunks(
   const wide = Math.max(1, Math.min(wave, Math.floor(totalFrames / minFramesPerChunk)));
   if (workerTimeoutSeconds === undefined) return wide;
 
-  const maxFramesPerChunk = Math.floor(
-    (workerTimeoutSeconds * WORKER_TIMEOUT_MARGIN - ESTIMATED_CHUNK_OVERHEAD_SECONDS) /
-      secondsPerFrame,
-  );
+  const maxFramesPerChunk = framesWithinWorkerTimeout(workerTimeoutSeconds, secondsPerFrame);
   const needed = maxFramesPerChunk < 1 ? Infinity : Math.ceil(totalFrames / maxFramesPerChunk);
   if (needed > MAX_PARALLEL_CHUNKS_CEILING) {
     const framesAtCeiling = Math.ceil(totalFrames / MAX_PARALLEL_CHUNKS_CEILING);
@@ -738,8 +769,8 @@ function assertPlanSizeWithinLimit(input: {
  * on tiny renders). Explicit numbers, including `240`, take precedence.
  *
  * Optional `targetChunkFrames` caps per-chunk frames in the auto-sized path:
- * the auto-sizer then targets `clamp(ceil(totalFrames / targetChunkFrames), 1,
- * maxParallelChunks)` chunks, so short videos collapse to fewer chunks and long
+ * the auto-sizer then targets `clamp(ceil(totalFrames / targetChunkFrames), minParallelChunks,
+ * maxParallelChunks)` chunks, so short videos drop to `minParallelChunks` and long
  * videos add chunks (up to the cap) to keep each one under the bound. It is a
  * no-op when omitted, and ignored when `configChunkSize` is set.
  */
@@ -748,6 +779,7 @@ export function resolveChunkPlan(
   configChunkSize: number | undefined,
   maxParallelChunks: number,
   targetChunkFrames?: number,
+  minParallelChunks = 1,
 ): { chunkCount: number; effectiveChunkSize: number } {
   // Integer-only inputs: a fractional `totalFrames` (e.g. 10.5) would
   // otherwise produce a last chunk with non-integer `endFrame`, and the
@@ -766,6 +798,7 @@ export function resolveChunkPlan(
   if (targetChunkFrames !== undefined) {
     assertPositiveInteger("targetChunkFrames", targetChunkFrames);
   }
+  assertPositiveInteger("minParallelChunks", minParallelChunks);
   // `targetChunkFrames` lowers the auto-sizer's effective parallelism so the
   // chosen chunk count keeps frames-per-chunk at or below the bound, without
   // ever exceeding `maxParallelChunks`. It only affects the auto-sized path
@@ -776,7 +809,10 @@ export function resolveChunkPlan(
   const autoSizeParallel =
     targetChunkFrames === undefined
       ? maxParallelChunks
-      : Math.min(maxParallelChunks, Math.max(1, Math.ceil(totalFrames / targetChunkFrames)));
+      : Math.min(
+          maxParallelChunks,
+          Math.max(minParallelChunks, Math.ceil(totalFrames / targetChunkFrames)),
+        );
   const resolvedChunkSize =
     configChunkSize ?? Math.max(MIN_CHUNK_SIZE, Math.ceil(totalFrames / autoSizeParallel));
   const naiveCount = Math.ceil(totalFrames / resolvedChunkSize);
@@ -835,6 +871,32 @@ export function buildChunkSlices(
     slices.push({ index: i, startFrame, endFrame });
   }
   return slices;
+}
+
+/**
+ * The plan's chunk cut: auto-sized plans re-cut the same chunk count by estimated capture cost;
+ * explicit `chunkSize` or uniform cost keeps {@link buildChunkSlices}; `targetChunkFrames` and the time limit cap it.
+ */
+export function buildPlanChunkSlices(
+  frameWeights: Float64Array,
+  config: Pick<DistributedRenderConfig, "chunkSize" | "targetChunkFrames">,
+  chunkCount: number,
+  effectiveChunkSize: number,
+  maxFramesPerChunk = Infinity,
+): ChunkSliceJson[] {
+  const weighted =
+    config.chunkSize === undefined
+      ? buildWeightedChunkSlices(
+          frameWeights,
+          chunkCount,
+          MIN_CHUNK_SIZE,
+          Math.min(config.targetChunkFrames ?? MAX_CHUNK_SIZE, MAX_CHUNK_SIZE, maxFramesPerChunk),
+        )
+      : null;
+  return withChunkCaptureCost(
+    weighted ?? buildChunkSlices(frameWeights.length, chunkCount, effectiveChunkSize),
+    frameWeights,
+  );
 }
 
 /**
@@ -912,6 +974,12 @@ function buildLockedRenderConfig(input: {
     preset,
     crf: config.crf,
     bitrate: config.bitrate,
+    maxBitrate: config.maxBitrate,
+    bufferSize: config.bufferSize,
+    keyframeIntervalFrames:
+      config.keyframeIntervalSeconds === undefined
+        ? undefined
+        : keyframeIntervalToGopSize({ num: config.fps, den: 1 }, config.keyframeIntervalSeconds),
     ...locksVp9CpuUsed,
     // GOP === chunkSize so every chunk's first frame is an IDR keyframe and
     // ffmpeg concat-copy round-trips losslessly.
@@ -919,6 +987,10 @@ function buildLockedRenderConfig(input: {
     closedGop: true,
     forceKeyframes: "n=0",
     pixelFormat,
+    // Omitted for the default so existing 4444 plans keep their planHash.
+    ...(config.proresProfile && config.proresProfile !== "4444"
+      ? { proresProfile: config.proresProfile }
+      : {}),
     chunkSize: input.effectiveChunkSize,
     chunkCount: input.chunkCount,
     runtimeEnv: input.runtimeEnv,
@@ -966,7 +1038,11 @@ function resolveEncoderTriple(config: DistributedRenderConfig): EncoderTriple {
         `libvpx-vp9, and png-sequence has no encoder.`,
     );
   }
-  return resolveNonMp4EncoderTriple(config.format, config.quality ?? "standard");
+  return resolveNonMp4EncoderTriple(
+    config.format,
+    config.quality ?? "standard",
+    config.proresProfile,
+  );
 }
 
 function resolveMp4EncoderTriple(codec: DistributedRenderConfig["codec"]): EncoderTriple {
@@ -991,9 +1067,11 @@ function resolveMp4EncoderTriple(codec: DistributedRenderConfig["codec"]): Encod
 function resolveNonMp4EncoderTriple(
   format: Exclude<DistributedFormat, "mp4">,
   quality: "draft" | "standard" | "high",
+  proresProfile?: ProresProfile,
 ): EncoderTriple {
   if (format === "mov") {
-    return { encoder: "prores-software", pixelFormat: "yuva444p10le", preset: "4444" };
+    const { pixelFormat, preset } = getEncoderPreset(quality, "mov", undefined, proresProfile);
+    return { encoder: "prores-software", pixelFormat, preset };
   }
   if (format === "webm") {
     // Defer to `getEncoderPreset` for the libvpx-vp9 preset string so the
@@ -1231,7 +1309,6 @@ async function compilePlanComposition(
     urlByAbsentLocalPath,
     projectDir,
     workDir,
-    htmlPath,
     entryFile,
     job,
     cfg,
@@ -1276,10 +1353,11 @@ async function compilePlanComposition(
   }
 
   // ── Probe ──
-  // Browser probe runs only when needed. For statically-resolvable durations
-  // this is a near-zero pass.
   stageStarted = Date.now();
   const probeResult = await runProbeStage({
+    recordReferenceBackground: createReferenceBackgroundRecorder((result) =>
+      Object.assign(job, result),
+    ),
     projectDir,
     workDir,
     job,
@@ -1297,6 +1375,21 @@ async function compilePlanComposition(
     subTimelineWaitMemo: {},
   });
   logPlanStage(log, "probe", stageStarted);
+  if (!probeResult.probeSession) {
+    stageStarted = Date.now();
+    Object.assign(
+      job,
+      await readPlanReferenceBackground({
+        projectDir,
+        workDir,
+        cfg,
+        log,
+        options: { width, height, fps: job.config.fps, variables: job.config.variables },
+      }),
+    );
+    assertNotAborted();
+    logPlanStage(log, "reference_background", stageStarted);
+  }
   compiled = probeResult.compiled;
   job.duration = probeResult.duration;
   job.totalFrames = probeResult.totalFrames;
@@ -1526,6 +1619,14 @@ export async function buildLocalExecutionPlan(
   const digests: PlanFileDigests = options.digests ?? new Map();
   const separateAudio = plansSeparateAudio(config, options);
   const chunksCarryAudio = !separateAudio && carriesChunkAudio(config, options);
+  const frameWeights = planFrameWeights({
+    videos: planVideosJson.videos,
+    extracted: planVideosJson.extracted,
+    totalFrames,
+    fps: config.fps,
+    width,
+    height,
+  });
   stageStarted = Date.now();
   const [audioOutcome, overlapOutcome, frameCostOutcome] = await Promise.allSettled([
     separateAudio
@@ -1579,8 +1680,20 @@ export async function buildLocalExecutionPlan(
     config.chunkSize,
     maxParallel,
     config.targetChunkFrames,
+    config.minParallelChunks,
   );
-  const chunks = buildChunkSlices(totalFrames, chunkCount, effectiveChunkSize);
+  const chunks = buildPlanChunkSlices(
+    frameWeights,
+    config,
+    chunkCount,
+    effectiveChunkSize,
+    chunkSizingUsesFrameCost(config) && config.workerTimeoutSeconds !== undefined
+      ? framesWithinWorkerTimeout(
+          config.workerTimeoutSeconds,
+          estimateFrameSeconds(megapixels, frameCostOutcome.value),
+        )
+      : undefined,
+  );
   const audioResult = audioOutcome.value;
   if (audioResult?.audioError) {
     applyDistributedAudioWarningPolicy(job, audioResult.audioError, audioResult.audioFailures, log);
@@ -1626,6 +1739,7 @@ export async function buildLocalExecutionPlan(
   // the planDir to compute planHash from the actual bytes the chunk worker
   // will read.
   const compositionJson: CompositionMetadataJson = {
+    ...referenceBackgroundResult(job[REFERENCE_BACKGROUND_FIELD]),
     durationSeconds: job.duration ?? 0,
     width,
     height,
@@ -1706,6 +1820,7 @@ export async function buildLocalExecutionPlan(
   });
 
   return {
+    ...referenceBackgroundResult(job[REFERENCE_BACKGROUND_FIELD]),
     executionPlanDir: planDir,
     executionPlanHash: planHash,
     chunkCount,
@@ -1766,6 +1881,7 @@ export async function plan(
 ): Promise<PlanResult> {
   const executionPlan = await buildLocalExecutionPlan(projectDir, config, planDir, options);
   return {
+    ...referenceBackgroundResult(executionPlan[REFERENCE_BACKGROUND_FIELD]),
     planDir: executionPlan.executionPlanDir,
     planProtocol: PLAN_PROTOCOL_V1,
     planHash: executionPlan.executionPlanHash,

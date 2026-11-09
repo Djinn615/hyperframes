@@ -5,7 +5,7 @@ import { launchManagedBrowser, resolveManagedGpuMode } from "../browser/launch.j
 // window drifting as the file is edited, hence the file-level suppression.
 // fallow-ignore-file code-duplication
 import { failCommand, setCommandExitCode } from "../utils/commandResult.js";
-import { defineCommand } from "citty";
+import { defineCommand } from "../utils/defineCommand.js";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
@@ -25,6 +25,7 @@ import {
   seekCompositionTimeline,
   waitForRuntimeReady,
 } from "../capture/captureCompositionFrame.js";
+import { failureMessage, jsonFailure } from "../utils/jsonError.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -50,7 +51,9 @@ interface ContrastEntry {
 const CONTRAST_SAMPLES = 5;
 const SEEK_SETTLE_MS = 150;
 const PREFERRED_SEEK_TARGET_WAIT_MS = 500;
-const MEDIA_EXTENSIONS = /\.(aac|flac|m4a|mov|mp3|mp4|oga|ogg|wav|webm)$/i;
+// Media files a proxy swap can abandon mid-fetch; an aborted non-image request for one is not a load failure.
+const MEDIA_EXTENSIONS =
+  /\.(3gp|aac|aif|aiff|avi|flac|flv|m2ts|m4a|m4v|mkv|mov|mp3|mp4|mpeg|mpg|mts|mxf|oga|ogg|ogv|opus|wav|weba|webm|wma|wmv)$/i;
 // Turn Puppeteer's opaque "Navigation timeout of Nms exceeded" into an
 // actionable message: the usual cause is a slow blocking CDN <script>. Returns a
 // replacement Error for a navigation timeout, or null for any other error.
@@ -73,6 +76,7 @@ export function shouldIgnoreRequestFailure(
   if (errorText === "net::ERR_ABORTED" && isOptionalCaptionOverridesRequest(url)) return true;
   if (errorText !== "net::ERR_ABORTED") return false;
   if (resourceType === "media") return true;
+  if (resourceType === "image") return false;
   try {
     return MEDIA_EXTENSIONS.test(new URL(url).pathname);
   } catch {
@@ -164,21 +168,30 @@ export async function auditClipDurations(
     // snapshot. Elements that already have a duration resolve immediately, so
     // this adds no latency in the common case.
     const deadline = Date.now() + maxWaitMs;
+    const reads = new Map<HTMLMediaElement, HTMLMediaElement>();
     await Promise.all(
       nodes.map((el) => {
         if (Number.isFinite(el.duration) && el.duration > 0) return Promise.resolve();
+        const probe = new Audio();
+        probe.preload = "metadata";
+        probe.src = el.currentSrc || el.src || el.querySelector("source")?.src || "";
+        reads.set(el, probe);
         return new Promise<void>((resolve) => {
           const cleanup = () => {
-            el.removeEventListener("loadedmetadata", onReady);
-            el.removeEventListener("error", onReady);
+            for (const target of [el, probe]) {
+              target.removeEventListener("loadedmetadata", onReady);
+              target.removeEventListener("error", onReady);
+            }
             clearTimeout(timer);
           };
           const onReady = () => {
             cleanup();
             resolve();
           };
-          el.addEventListener("loadedmetadata", onReady, { once: true });
-          el.addEventListener("error", onReady, { once: true });
+          for (const target of [el, probe]) {
+            target.addEventListener("loadedmetadata", onReady, { once: true });
+            target.addEventListener("error", onReady, { once: true });
+          }
           const timer = setTimeout(onReady, Math.max(0, deadline - Date.now()));
         });
       }),
@@ -205,7 +218,9 @@ export async function auditClipDurations(
           "data-playback-rate": el.getAttribute("data-playback-rate"),
           "data-automation": el.getAttribute("data-automation"),
         },
-        duration: el.duration,
+        duration: Number.isFinite(el.duration)
+          ? el.duration
+          : (reads.get(el)?.duration ?? Number.NaN),
         loop: el.loop || el.getAttribute("data-loop") === "true",
       });
     }
@@ -603,7 +618,10 @@ function emitFailureReport(message: string, asJson: boolean): void {
   if (asJson) {
     console.log(
       JSON.stringify(
-        withMeta({ ok: false, error: message, errors: [], warnings: [] }, { deprecated: true }),
+        withMeta(
+          { ...jsonFailure("runtime_error", message), errors: [], warnings: [] },
+          { deprecated: true },
+        ),
         null,
         2,
       ),
@@ -657,7 +675,7 @@ Examples:
       setCommandExitCode(exitCode);
       return;
     } catch (err: unknown) {
-      const message = normalizeErrorMessage(err);
+      const message = failureMessage(err);
       emitFailureReport(message, asJson);
       failCommand();
     }

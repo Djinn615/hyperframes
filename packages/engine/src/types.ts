@@ -4,12 +4,23 @@
  * The engine's page contract. Any web page that wants to be rendered
  * as video must expose `window.__hf` implementing the HfProtocol interface.
  */
+import type { ReferenceBackground } from "./services/referenceBackground.js";
 import type { AudioFailureDiagnostic } from "./services/audioMixer.types.js";
-import type { Fps } from "@hyperframes/core";
+import type { Fps, MotionBlurFingerprint } from "@hyperframes/core";
+import type { CompositionLengthSource } from "@hyperframes/core/runtime/composition-length";
 import type { ChromeMemoryStats } from "./services/chromeMemorySampler.js";
 import type { MotionBlurOptions } from "./services/motionBlur.js";
 
 export type PageMotionBlurOff = "off" | "hdr-render" | "layered-composite" | "distributed-render";
+
+export interface PageMotionBlurSummary {
+  tier: "capture" | "filter" | null;
+  reasonCode: string | null;
+  movers: number;
+  failedFrames: number;
+  readEvents: boolean;
+  fingerprint: MotionBlurFingerprint | null;
+}
 
 /**
  * Outcome of waiting for a sub-composition's GSAP timelines to register.
@@ -19,16 +30,18 @@ export type PageMotionBlurOff = "off" | "hdr-render" | "layered-composite" | "di
 export type SubTimelineWaitOutcome = "ready" | "timeout" | "script_failure";
 
 /**
- * Shared by every capture session of one render: composition ids whose timeline
- * wait already timed out, so later sessions report the timeout without waiting again.
+ * Shared by every capture session of one render: timeline waits that already timed out
+ * (so later sessions skip the wait), and scene callback errors the render log already shows.
  */
 export interface SubTimelineWaitMemo {
   unregisteredIds?: readonly string[];
+  loggedSceneCallbackErrors?: string[];
 }
 
 export type CaptureWarningCode =
   | "media_readiness_timeout"
   | "media_load_failed"
+  | "image_missing_from_frame"
   | "audio_processing_failed"
   | "sub_timeline_readiness_timeout"
   | "sub_timeline_script_failure"
@@ -129,19 +142,25 @@ export interface HfSeekOptions {
 export interface HfProtocol {
   /** Total duration of the composition in seconds */
   duration: number;
+  /** Which input set `duration`. */
+  lengthSource?: CompositionLengthSource;
   /** Seek to a specific time. Must produce deterministic visual output. */
   seek(time: number, options?: HfSeekOptions): void;
   /** Optional: media elements the engine should handle */
   media?: HfMediaElement[];
   /** Optional: shader transition metadata, populated by @hyperframes/shader-transitions */
   transitions?: HfTransitionMeta[];
+  clipWindow?(el: Element): { start: number; end: number } | null;
 }
 
 // ── Capture Types ──────────────────────────────────────────────────────────────
 
 export interface CaptureOptions {
+  /** Shared once-only reader, invoked before capture changes root/body paint. */
+  recordReferenceBackground?: (read: () => Promise<ReferenceBackground>) => Promise<void>;
   width: number;
   height: number;
+  onSubTimelineScriptFailure?: (warnings: readonly CaptureWarning[]) => void;
   /**
    * Producer-resolved composition duration (seconds) — the data-duration
    * clamp actually rendered, which can differ from the page's raw
@@ -168,6 +187,8 @@ export interface CaptureOptions {
    */
   fps: Fps;
   format?: "jpeg" | "png";
+  transparent?: boolean;
+  hiddenElementIds?: string[];
   quality?: number;
   /**
    * Opt into sub-frame multi-sample motion blur (issue #4010). Absent means off and the
@@ -240,6 +261,9 @@ export interface CaptureOptions {
    * Clamped to 0..8 like the env knob; HF_DE_VERIFY, when set, still wins.
    */
   deVerifySamples?: number;
+  deFrameFallback?: boolean;
+  onEffectScanProgress?: (scannedFrames: number, totalFrames: number) => void;
+  onEffectScanEnd?: () => void;
 }
 
 export interface CaptureVideoMetadataHint {
@@ -266,6 +290,7 @@ export interface CapturePerfSummary {
   avgSeekMs: number;
   avgBeforeCaptureMs: number;
   avgScreenshotMs: number;
+  captureBeyondViewport?: boolean;
   /**
    * Median per-frame capture time — warmup-robust, unlike `avgTotalMs`
    * (first frames pay font/image decode + GC that swamps short renders'
@@ -391,11 +416,12 @@ export interface CapturePerfSummary {
   chromeMemorySamples?: number;
   /**
    * Low-cardinality init-time gate that routed a drawElement-eligible session
-   * to the baseline: `swiftshader` | `css_effect:<fx>` | `at_risk_timeline` |
-   * `3d_init_failed` | `supersampling` | `render_mode_hint`. Undefined when
-   * drawElement ran or was never attempted.
+   * to the baseline: `swiftshader` | `webgl_unavailable` | `beginframe_no_self_verify` |
+   * `css_effect:<fx>` | `at_risk_timeline` | `3d_init_failed` | `supersampling` |
+   * `render_mode_hint`. Undefined when drawElement ran or was never attempted.
    */
   deGateReason?: string;
+  motionBlur?: PageMotionBlurSummary;
   /**
    * Full-fidelity fallback trigger — the specific reason (CSS FX + property,
    * e.g. `filter:blur`, `filter:drop-shadow`, `backdrop-filter`, `clip-path`,
@@ -416,6 +442,7 @@ export interface CapturePerfSummary {
   deVerifyInitMs: number;
   /** Clip-cut boundary frames routed to per-frame screenshot (Lim 6). */
   deBoundaryFrames: number;
+  deRiskFrames: number;
   /** Per-frame "No cached paint record" screenshot fallbacks during capture. */
   deNcprFallbacks: number;
   /**
@@ -432,5 +459,6 @@ export interface CapturePerfSummary {
 declare global {
   interface Window {
     __hf?: HfProtocol;
+    __HF_VIRTUAL_TIME__?: { originalSetTimeout?: typeof setTimeout };
   }
 }

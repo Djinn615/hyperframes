@@ -1,7 +1,8 @@
 import { setCommandExitCode } from "../utils/commandResult.js";
-import { defineCommand } from "citty";
+import { defineCommand } from "../utils/defineCommand.js";
 import type { Example } from "./_examples.js";
 import { c } from "../ui/colors.js";
+import { failureMessage, jsonFailure } from "../utils/jsonError.js";
 
 export const examples: Example[] = [
   ["Lint the current project", "hyperframes lint"],
@@ -11,6 +12,7 @@ export const examples: Example[] = [
   ["Include info-level findings", "hyperframes lint --verbose"],
 ];
 import { formatLintFindings } from "../utils/lintFormat.js";
+import { unmountedNotice } from "@hyperframes/lint";
 import { lintProject } from "../utils/lintProject.js";
 import { isUnderCompositions, resolveLintTarget } from "../utils/project.js";
 import { trackLintRun } from "../telemetry/lintRun.js";
@@ -38,6 +40,16 @@ export default defineCommand({
       description: "Show info-level findings (hidden by default)",
       default: false,
     },
+    "include-unmounted": {
+      type: "boolean",
+      description: "Also lint compositions/ files that index.html never mounts",
+      default: false,
+    },
+    "lint-verbose": {
+      type: "boolean",
+      description: "Same as --verbose (render, preview and publish spell it --lint-verbose)",
+      default: false,
+    },
   },
   async run({ args }) {
     // Set process.exitCode + return instead of process.exit(): process.exit()
@@ -47,6 +59,7 @@ export default defineCommand({
     // first, then Node exits with the set code — the pattern the other commands
     // (publish/transcribe/upgrade/play/present) already use.
     try {
+      const verbose = Boolean(args.verbose || args["lint-verbose"]);
       const { project, entryFile } = resolveLintTarget(args.dir);
       const startedAt = Date.now();
       const lintResult = await lintProject(
@@ -55,7 +68,9 @@ export default defineCommand({
         entryFile && isUnderCompositions(project.dir, entryFile)
           ? { isSubComposition: true }
           : undefined,
+        { includeUnmounted: Boolean(args["include-unmounted"]) },
       );
+      const unmounted = lintResult.unmountedCompositions ?? [];
       trackLintRun(project.dir, lintResult, {
         command: "lint",
         durationMs: Date.now() - startedAt,
@@ -69,8 +84,9 @@ export default defineCommand({
           errorCount: lintResult.totalErrors,
           warningCount: lintResult.totalWarnings,
           infoCount: lintResult.totalInfos,
-          findings: args.verbose ? allFindings : allFindings.filter((f) => f.severity !== "info"),
+          findings: verbose ? allFindings : allFindings.filter((f) => f.severity !== "info"),
           filesScanned: lintResult.results.length,
+          unmountedCompositions: unmounted,
         };
         console.log(JSON.stringify(withMeta(combined), null, 2));
         setCommandExitCode(combined.ok ? 0 : 1);
@@ -81,6 +97,7 @@ export default defineCommand({
       const fileLabel =
         fileCount === 1 ? (lintResult.results[0]?.file ?? "index.html") : `${fileCount} files`;
       console.log(`${c.accent("◆")}  Linting ${c.accent(`${project.name}/${fileLabel}`)}`);
+      if (unmounted.length > 0) console.log(c.dim(unmountedNotice(unmounted.length)));
       console.log();
 
       if (lintResult.totalErrors === 0 && lintResult.totalWarnings === 0) {
@@ -91,20 +108,19 @@ export default defineCommand({
       const lines = formatLintFindings(lintResult, {
         showElementId: true,
         showSummary: true,
-        verbose: args.verbose,
+        verbose,
       });
       for (const line of lines) console.log(line);
 
       setCommandExitCode(lintResult.totalErrors > 0 ? 1 : 0);
       return;
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = failureMessage(err);
       if (args.json) {
         console.log(
           JSON.stringify(
             withMeta({
-              ok: false,
-              error: message,
+              ...jsonFailure("runtime_error", message),
               findings: [],
               errorCount: 0,
               warningCount: 0,

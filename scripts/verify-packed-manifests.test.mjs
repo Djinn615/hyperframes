@@ -1,16 +1,18 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { describe, it } from "node:test";
 import { Worker } from "node:worker_threads";
 import {
+  parsePackJson,
   ageBlockedPackages,
   CONSUMER_TSCONFIG,
   countTypeErrorsByPackage,
   installConsumer,
+  keepPackedTarballs,
   listPackedExportContracts,
   listPackageSizeIssues,
   listPackedJavaScriptImportIssues,
@@ -23,6 +25,18 @@ import {
 const TSC = join(import.meta.dirname, "..", "node_modules", "typescript", "bin", "tsc");
 
 describe("packed manifest verifier", () => {
+  it("reads pack JSON after lifecycle output and refuses malformed results", () => {
+    const record = { filename: "/tmp/share.tgz" };
+    assert.deepEqual(
+      parsePackJson(
+        `> share prepare\n> npm run build\n\n${JSON.stringify(record, null, 2)}\n`,
+        "share",
+      ),
+      [record],
+    );
+    assert.deepEqual(parsePackJson(JSON.stringify([record]), "share"), [record]);
+    assert.throws(() => parsePackJson("build failed", "share"), /Could not parse/);
+  });
   it("passes a package inside its size budget", () => {
     const budget = { packed: 1000, unpacked: 4000 };
     assert.deepEqual(listPackageSizeIssues("pkg", { packed: 950, unpacked: 3900 }, budget), []);
@@ -181,6 +195,19 @@ describe("packed manifest verifier", () => {
     }
   }
 
+  it("ignores JSDoc type imports and string examples while checking executable imports", () => {
+    withPackedFiles(
+      {
+        "src/index.mjs": `/** @typedef {import("./types").Host} Host */\nconst example = 'import("./example")';\nimport("./missing");\n`,
+      },
+      ["src/index.mjs"],
+      (tarball, files) => {
+        assert.deepEqual(listPackedJavaScriptImportIssues(tarball, files), [
+          "src/index.mjs:3 imports ./missing",
+        ]);
+      },
+    );
+  });
   it("passes explicit relative JavaScript imports whose target is packed", () => {
     withPackedFiles(
       {
@@ -442,5 +469,18 @@ describe("packed consumer install", () => {
     await withRegistry("fake-dep", versions, (registry, dir) =>
       assert.throws(() => install(registry, dir, { "missing-dep": "^1.0.0" }), /missing-dep/),
     );
+  });
+});
+
+describe("keepPackedTarballs", () => {
+  it("copies the tarballs and nothing else", () => {
+    const from = mkdtempSync(join(tmpdir(), "keep-from-"));
+    const to = join(mkdtempSync(join(tmpdir(), "keep-to-")), "out");
+    writeFileSync(join(from, "a-1.0.0.tgz"), "a");
+    writeFileSync(join(from, "notes.txt"), "x");
+    keepPackedTarballs(from, to);
+    assert.deepEqual(readdirSync(to), ["a-1.0.0.tgz"]);
+    assert.equal(readFileSync(join(to, "a-1.0.0.tgz"), "utf8"), "a");
+    rmSync(from, { recursive: true, force: true });
   });
 });

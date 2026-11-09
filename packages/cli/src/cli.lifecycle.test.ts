@@ -145,6 +145,32 @@ describe("CLI lifecycle", () => {
     });
   });
 
+  it("runs `open` for a bare project folder, and keeps `render` a command", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hf-cli-shortcut-"));
+    const run = vi.fn();
+    try {
+      for (const [name, argv] of [
+        ["open", [dir]],
+        ["open", ["--verbose", dir]],
+        ["render", ["render"]],
+      ] as const) {
+        vi.doMock(`./commands/${name}.js`, () => ({
+          default: { meta: { name }, args: { dir: { type: "positional", required: false } }, run },
+        }));
+        mockTelemetry();
+        process.argv = ["node", "cli.ts", ...argv];
+        await import("./cli.js");
+        await vi.dynamicImportSettled();
+        vi.doUnmock(`./commands/${name}.js`);
+        vi.resetModules();
+      }
+      expect(run.mock.calls.map(([ctx]) => ctx.rawArgs)).toEqual([[dir], [dir], []]);
+      expect(process.argv.slice(2)).toEqual(["render"]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("hands queued events to flushSync even after finalizeCli has run", async () => {
     const flushSync = vi.fn();
     const trackCommandResult = vi.fn();
@@ -271,6 +297,53 @@ describe("CLI lifecycle", () => {
     }
   });
 
+  it("keeps exit 0 when a late rejection follows a command that already delivered", async () => {
+    // check and snapshot close Chrome after printing; on Windows that teardown can reject.
+    const trackCommandResult = vi.fn();
+    const priorListeners = process.listeners("unhandledRejection");
+    process.removeAllListeners("unhandledRejection");
+    try {
+      mockInitCommand(() => {});
+      mockTelemetry({ trackCommandResult });
+
+      process.argv = ["node", "cli.ts", "init", "--json"];
+      await import("./cli.js");
+      expect(process.exitCode).toBe(0);
+
+      process.emit("unhandledRejection", new Error("late browser teardown"), Promise.resolve());
+
+      expect(process.exitCode).toBe(0);
+      expect(trackCommandResult).toHaveBeenCalledWith(
+        expect.objectContaining({ success: true, exitCode: 0 }),
+      );
+    } finally {
+      process.removeAllListeners("unhandledRejection");
+      for (const listener of priorListeners) process.on("unhandledRejection", listener);
+    }
+  });
+
+  it("exits 0 when a late uncaught exception follows a command that already delivered", async () => {
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+    const priorListeners = process.listeners("uncaughtException");
+    process.removeAllListeners("uncaughtException");
+    try {
+      mockInitCommand(() => {});
+      mockTelemetry({ trackCommandResult: vi.fn() });
+
+      process.argv = ["node", "cli.ts", "init", "--json"];
+      await import("./cli.js");
+      exitSpy.mockClear();
+
+      process.emit("uncaughtException", new Error("late child teardown"));
+
+      expect(exitSpy).toHaveBeenCalledWith(0);
+    } finally {
+      process.removeAllListeners("uncaughtException");
+      for (const listener of priorListeners) process.on("uncaughtException", listener);
+      exitSpy.mockRestore();
+    }
+  });
+
   it("still exits non-zero when a command throws and no render ever validated", async () => {
     // The guard on the sanitizer above: it must key off a validated artifact,
     // not merely off the command having finished. Without this, every caught
@@ -293,7 +366,7 @@ describe("CLI lifecycle", () => {
     }
   });
 
-  it("still scores an EPIPE before the artifact is validated as a failure", async () => {
+  it("exits 1 and scores a failure when the pipe closes before the run delivered", async () => {
     const trackCommandResult = vi.fn();
     const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
     try {
@@ -303,7 +376,8 @@ describe("CLI lifecycle", () => {
       process.argv = ["node", "cli.ts", "init", "--json"];
       await import("./cli.js");
 
-      expect(exitSpy).toHaveBeenCalledWith(0);
+      // `hyperframes render … | head -1` on a refused render exited 0 (CLI 0.9.11)
+      expect(exitSpy).toHaveBeenCalledWith(1);
       expect(trackCommandResult).toHaveBeenCalledWith(expect.objectContaining({ success: false }));
     } finally {
       exitSpy.mockRestore();

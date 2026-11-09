@@ -740,7 +740,171 @@ const RETIRED_ROUTING_FILES = [
 const FALLOW_PRUNE_REASON =
   "fallow 3 reuses one audit snapshot per checkout and the hook prunes with `fallow audit-cache prune`, replacing this script";
 
+const PLAN_V1_SAMPLE_REASON =
+  "Plan v1 is no longer a supported cloud transport; the adapters, workflows and smoke tests now accept Plan v2 only";
+
+const PLAN_V1_SAMPLE_FILES = [
+  "examples/aws-lambda/sample-events/assemble-v1.json",
+  "examples/aws-lambda/sample-events/plan-v1.json",
+  "examples/aws-lambda/sample-events/render-chunk-v1.json",
+  "examples/gcp-cloud-run/sample-events/assemble-v1.json",
+  "examples/gcp-cloud-run/sample-events/plan-v1.json",
+  "examples/gcp-cloud-run/sample-events/render-chunk-v1.json",
+];
+
+const PLAN_PARITY_HARNESS_REASON =
+  "the completed Plan v1-to-v2 rollout harness has no supported v1 cloud path left to exercise";
+
+const PLAN_PARITY_HARNESS_FILES = [
+  "examples/aws-lambda/scripts/_semantic-compare.sh",
+  "examples/aws-lambda/scripts/semantic-compare.test.sh",
+  "packages/producer/fixtures/plan-parity-size-pressure/.plan-parity-fixture.json",
+  "packages/producer/fixtures/plan-parity-size-pressure/index.html",
+  "packages/producer/fixtures/plan-parity-visual-audio/.plan-parity-fixture.json",
+  "packages/producer/fixtures/plan-parity-visual-audio/index.html",
+  "packages/producer/src/plan-parity-analysis.test.ts",
+  "packages/producer/src/plan-parity-analysis.ts",
+  "packages/producer/src/plan-parity-contract.test.ts",
+  "packages/producer/src/plan-parity-contract.ts",
+  "packages/producer/src/plan-parity-fixture.test.ts",
+  "packages/producer/src/plan-parity-fixture.ts",
+  "packages/producer/src/plan-parity-harness.test.ts",
+  "packages/producer/src/plan-parity-harness.ts",
+  "packages/producer/src/plan-parity-lambda-local-driver.ts",
+];
+
 export const ALLOWED_DELETIONS = new Map([
+  // Prompt Guide as six topic pages
+  [
+    "docs/prompting/anatomy.mdx",
+    "the Prompt Guide is six topic pages now; this page's content is a section of one of them, and the old URL 301s there (docs.json)",
+  ],
+  [
+    "docs/prompting/audio-effects.mdx",
+    "the Prompt Guide is six topic pages now; this page's content is a section of one of them, and the old URL 301s there (docs.json)",
+  ],
+  [
+    "docs/prompting/code-blocks.mdx",
+    "the Prompt Guide is six topic pages now; this page's content is a section of one of them, and the old URL 301s there (docs.json)",
+  ],
+  [
+    "docs/prompting/generated-artwork.mdx",
+    "the Prompt Guide is six topic pages now; this page's content is a section of one of them, and the old URL 301s there (docs.json)",
+  ],
+  [
+    "docs/prompting/iterating.mdx",
+    "the Prompt Guide is six topic pages now; this page's content is a section of one of them, and the old URL 301s there (docs.json)",
+  ],
+  [
+    "docs/prompting/overlays-and-lower-thirds.mdx",
+    "the Prompt Guide is six topic pages now; this page's content is a section of one of them, and the old URL 301s there (docs.json)",
+  ],
+  [
+    "docs/prompting/rules-and-anti-patterns.mdx",
+    "the Prompt Guide is six topic pages now; this page's content is a section of one of them, and the old URL 301s there (docs.json)",
+  ],
+  [
+    "docs/prompting/runtimes-and-3d.mdx",
+    "the Prompt Guide is six topic pages now; this page's content is a section of one of them, and the old URL 301s there (docs.json)",
+  ],
+  [
+    "docs/prompting/specification-dial.mdx",
+    "the Prompt Guide is six topic pages now; this page's content is a section of one of them, and the old URL 301s there (docs.json)",
+  ],
+  [
+    "docs/prompting/storyboards.mdx",
+    "the Prompt Guide is six topic pages now; this page's content is a section of one of them, and the old URL 301s there (docs.json)",
+  ],
+  [
+    "docs/prompting/transitions.mdx",
+    "the Prompt Guide is six topic pages now; this page's content is a section of one of them, and the old URL 301s there (docs.json)",
+  ],
+  [
+    "docs/prompting/variables-and-templating.mdx",
+    "the Prompt Guide is six topic pages now; this page's content is a section of one of them, and the old URL 301s there (docs.json)",
+  ],
+  [
+    "docs/prompting/vfx-and-liquid-glass.mdx",
+    "the Prompt Guide is six topic pages now; this page's content is a section of one of them, and the old URL 301s there (docs.json)",
+  ],
+  [
+    "docs/prompting/visual-specs.mdx",
+    "the Prompt Guide is six topic pages now; this page's content is a section of one of them, and the old URL 301s there (docs.json)",
+  ],
+  [
+    "docs/prompting/vocabulary.mdx",
+    "the Prompt Guide is six topic pages now; this page's content is a section of one of them, and the old URL 301s there (docs.json)",
+  ],
+  [
+    "docs/prompting/rendering-and-output.mdx",
+    "moved into the CLI rendering guide as 'Ask the agent for the right output'; the old URL 301s there (docs.json)",
+  ],
+  [
+    "docs/guides/color-grading.mdx",
+    "color grading is now the 'Fix and grade the color' section of the media effects guide; the old URL 301s there (docs.json)",
+  ],
+  // One troubleshooting page and start-page folds
+  [
+    "docs/guides/troubleshooting.mdx",
+    "one Troubleshooting page for the whole site (help.mdx) holds this page section by section; the old URL 301s there",
+  ],
+  [
+    "docs/studio/troubleshooting.mdx",
+    "its sections are the browser editor part of the one Troubleshooting page (help.mdx); the old URL 301s there",
+  ],
+  [
+    "docs/studio-app/troubleshooting.mdx",
+    "its sections are the Studio app part of the one Troubleshooting page (help.mdx); update notes already live on the install page; the old URL 301s there",
+  ],
+  [
+    "docs/guides/feedback.mdx",
+    "its sections are the Share feedback part of the one Troubleshooting page (help.mdx); the old URL 301s there",
+  ],
+  [
+    "docs/go-further.mdx",
+    "its one point (agent for big changes, hands-on edits for small ones) is the Edit a video with the agent page; the old URL 301s there",
+  ],
+  [
+    "docs/guides/choose-creation-path.mdx",
+    "the quickstart is the three-door start page that answers the same question; the old URL 301s there",
+  ],
+  // Browser editor docs as six pages
+  [
+    "docs/studio/animation.mdx",
+    "the browser editor docs are six pages now; this page's content is a section of one of them, and the old URL 301s there (docs.json)",
+  ],
+  [
+    "docs/studio/audio-automation.mdx",
+    "the browser editor docs are six pages now; this page's content is a section of one of them, and the old URL 301s there (docs.json)",
+  ],
+  [
+    "docs/studio/audio-groups.mdx",
+    "the browser editor docs are six pages now; this page's content is a section of one of them, and the old URL 301s there (docs.json)",
+  ],
+  [
+    "docs/studio/captions.mdx",
+    "the browser editor docs are six pages now; this page's content is a section of one of them, and the old URL 301s there (docs.json)",
+  ],
+  [
+    "docs/studio/shortcuts.mdx",
+    "the browser editor docs are six pages now; this page's content is a section of one of them, and the old URL 301s there (docs.json)",
+  ],
+  [
+    "docs/studio/slideshows.mdx",
+    "the browser editor docs are six pages now; this page's content is a section of one of them, and the old URL 301s there (docs.json)",
+  ],
+  [
+    "docs/studio/source.mdx",
+    "the browser editor docs are six pages now; this page's content is a section of one of them, and the old URL 301s there (docs.json)",
+  ],
+  [
+    "docs/studio/variables.mdx",
+    "the browser editor docs are six pages now; this page's content is a section of one of them, and the old URL 301s there (docs.json)",
+  ],
+  [
+    "docs/studio/voiceover-carve.mdx",
+    "the browser editor docs are six pages now; this page's content is a section of one of them, and the old URL 301s there (docs.json)",
+  ],
   [
     "docs/public/images/studio-app/export.jpg",
     "the Studio app docs show Export as a recorded demo with its own poster; nothing links this still any more",
@@ -748,6 +912,30 @@ export const ALLOWED_DELETIONS = new Map([
   [
     "docs/public/images/studio-app/project.jpg",
     "the project screen page is built from recorded clips and posters; nothing links this still any more",
+  ],
+  [
+    "docs/prompting/captions-and-talking-heads.mdx",
+    "each Make guide now holds these prompts as its 'Prompts that work' section; the old URL 301s there (docs.json)",
+  ],
+  [
+    "docs/prompting/code-and-prs.mdx",
+    "each Make guide now holds these prompts as its 'Prompts that work' section; the old URL 301s there (docs.json)",
+  ],
+  [
+    "docs/prompting/explainers.mdx",
+    "each Make guide now holds these prompts as its 'Prompts that work' section; the old URL 301s there (docs.json)",
+  ],
+  [
+    "docs/prompting/motion-graphics.mdx",
+    "each Make guide now holds these prompts as its 'Prompts that work' section; the old URL 301s there (docs.json)",
+  ],
+  [
+    "docs/prompting/music-and-slideshows.mdx",
+    "each Make guide now holds these prompts as its 'Prompts that work' section; the old URL 301s there (docs.json)",
+  ],
+  [
+    "docs/prompting/product-launch.mdx",
+    "each Make guide now holds these prompts as its 'Prompts that work' section; the old URL 301s there (docs.json)",
   ],
   [
     "packages/studio/src/components/renders/useRenderQueueMotionBlur.test.tsx",
@@ -1917,6 +2105,8 @@ export const ALLOWED_DELETIONS = new Map([
   ],
   ["scripts/prune-fallow-audit-caches.mjs", FALLOW_PRUNE_REASON],
   ["scripts/prune-fallow-audit-caches.test.mjs", FALLOW_PRUNE_REASON],
+  ...PLAN_V1_SAMPLE_FILES.map((path) => [path, PLAN_V1_SAMPLE_REASON]),
+  ...PLAN_PARITY_HARNESS_FILES.map((path) => [path, PLAN_PARITY_HARNESS_REASON]),
   [
     "packages/engine/src/services/frameCapture-releaseInjectedVideoMedia.browser.test.ts",
     "the revert of #5795 removes releaseInjectedVideoMedia, the only code this file tested",
@@ -1924,6 +2114,18 @@ export const ALLOWED_DELETIONS = new Map([
   [
     ".github/workflows/lambda-ffmpeg.yml",
     "the ffmpeg build moves into lambda-arm64-image.yml, which also builds and smokes the image",
+  ],
+  [
+    "skills/remotion-to-hyperframes/scripts/frame_strip.sh",
+    "remotion-to-hyperframes now compares with `hyperframes diff` instead of its own shell scripts",
+  ],
+  [
+    "skills/remotion-to-hyperframes/scripts/render_diff.sh",
+    "remotion-to-hyperframes now compares with `hyperframes diff` instead of its own shell scripts",
+  ],
+  [
+    "packages/cli/src/commands/cloud/render.pageMotionBlur.test.ts",
+    "tests for the removed cloud render --page-motion-blur flag; the hosted render API never accepted the field",
   ],
 ]);
 
